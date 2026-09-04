@@ -13,6 +13,7 @@ import {
   MAX_PARALLEL_SUBAGENTS,
 } from "./security/limits.ts";
 import { getProjectConfigPath, getUserConfigPath } from "./paths.ts";
+import { normalizeAllowedHost } from "./security/ssrf.ts";
 
 export type FeatureToggle = boolean | { enabled?: boolean };
 
@@ -46,6 +47,12 @@ export interface WebFeatureConfig {
   enabled?: boolean;
   search?: WebSearchConfig;
   fetch?: WebFetchConfig;
+  /**
+   * Private hosts the user deliberately trusts, as `host` or `host:port`.
+   * Needed for self-hosted services such as a local SearXNG instance, which the
+   * private-address guard would otherwise block.
+   */
+  allowedHosts?: string[];
 }
 
 export interface SubagentsFeatureConfig {
@@ -73,6 +80,7 @@ export interface ResolvedMcpConfig {
 
 export interface ResolvedWebConfig {
   enabled: boolean;
+  allowedHosts: ReadonlySet<string>;
   search: {
     provider: SearchProviderName;
     braveApiKey?: string;
@@ -152,29 +160,82 @@ function readJsonFile(filePath: string, warnings: string[]): unknown {
   }
 }
 
-function asFile(value: unknown): PiEssentialsFile {
-  if (!isObject(value)) return {};
+function asFile(value: unknown, filePath: string, warnings: string[]): PiEssentialsFile {
+  if (value === undefined) return {};
+  if (!isObject(value)) {
+    warnings.push(`Ignoring ${filePath}: expected a JSON object at the top level.`);
+    return {};
+  }
+  const known = new Set<string>(FEATURE_KEYS);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      warnings.push(`Unknown option "${key}" in ${filePath}; expected one of ${[...known].join(", ")}.`);
+    }
+  }
   return value as PiEssentialsFile;
 }
 
-function mergeFiles(base: PiEssentialsFile, overlay: PiEssentialsFile): PiEssentialsFile {
-  return {
-    mcp: overlay.mcp ?? base.mcp,
-    web: overlay.web === undefined ? base.web : mergeMaybeObject(base.web, overlay.web),
-    subagents: overlay.subagents === undefined ? base.subagents : mergeMaybeObject(base.subagents, overlay.subagents),
-    todos: overlay.todos ?? base.todos,
-    questions: overlay.questions ?? base.questions,
-  };
+const FEATURE_KEYS = ["mcp", "web", "subagents", "todos", "questions"] as const;
+
+/** Layer one config file over another; later files win, objects merge key by key. */
+export function mergeFiles(base: PiEssentialsFile, overlay: PiEssentialsFile): PiEssentialsFile {
+  const merged: PiEssentialsFile = { ...base };
+  for (const key of FEATURE_KEYS) {
+    const next = overlay[key];
+    if (next === undefined) continue;
+    (merged as Record<string, unknown>)[key] = mergeMaybeObject(base[key], next);
+  }
+  return merged;
 }
 
 function mergeMaybeObject<T>(base: boolean | T | undefined, overlay: boolean | T): boolean | T {
   if (typeof overlay === "boolean" || typeof base === "boolean" || base === undefined) return overlay;
-  if (isObject(base) && isObject(overlay)) return { ...base, ...overlay } as T;
+  if (isObject(base) && isObject(overlay)) return deepMerge(base, overlay) as T;
   return overlay;
+}
+
+function deepMerge(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(overlay)) {
+    const existing = out[key];
+    out[key] = isObject(existing) && isObject(value) ? deepMerge(existing, value) : value;
+  }
+  return out;
 }
 
 function envOr(configValue: string | undefined, envName: string): string | undefined {
   return configValue || optionalString(process.env[envName]);
+}
+
+/**
+ * Build the private-host allowlist. A configured SearXNG instance is trusted
+ * implicitly: pointing `searxngUrl` at localhost is the normal way to run one,
+ * and silently blocking it would make the setting useless.
+ */
+function resolveAllowedHosts(
+  configured: unknown,
+  searxngUrl: string | undefined,
+  warnings: string[],
+): ReadonlySet<string> {
+  const hosts = new Set<string>();
+  const add = (entry: string, source: string) => {
+    const normalized = normalizeAllowedHost(entry);
+    if (normalized) hosts.add(normalized);
+    else warnings.push(`Ignoring unparseable ${source} entry "${entry}".`);
+  };
+
+  if (configured !== undefined) {
+    if (Array.isArray(configured)) {
+      for (const entry of configured) {
+        if (typeof entry === "string") add(entry, "web.allowedHosts");
+        else warnings.push("web.allowedHosts entries must be strings.");
+      }
+    } else {
+      warnings.push("web.allowedHosts must be an array of host or host:port strings.");
+    }
+  }
+  if (searxngUrl) add(searxngUrl, "web.search.searxngUrl");
+  return hosts;
 }
 
 export function resolveConfig(file: PiEssentialsFile, warnings: string[] = []): ResolvedConfig {
@@ -187,6 +248,7 @@ export function resolveConfig(file: PiEssentialsFile, warnings: string[] = []): 
   const search = isObject(webObj.search) ? webObj.search : {};
   const fetch = isObject(webObj.fetch) ? webObj.fetch : {};
 
+  const searxngUrl = optionalString(search.searxngUrl) ?? optionalString(process.env.SEARXNG_URL);
   const providerRaw = optionalString(search.provider) ?? "auto";
   const providers: SearchProviderName[] = ["auto", "duckduckgo", "brave", "tavily", "exa", "jina", "searxng"];
   const provider = (providers.includes(providerRaw as SearchProviderName) ? providerRaw : "auto") as SearchProviderName;
@@ -202,13 +264,14 @@ export function resolveConfig(file: PiEssentialsFile, warnings: string[] = []): 
     },
     web: {
       enabled: enabledFrom(webIn, true),
+      allowedHosts: resolveAllowedHosts(webObj.allowedHosts, searxngUrl, warnings),
       search: {
         provider,
         braveApiKey: envOr(optionalString(search.braveApiKey), "BRAVE_API_KEY"),
         tavilyApiKey: envOr(optionalString(search.tavilyApiKey), "TAVILY_API_KEY"),
         exaApiKey: envOr(optionalString(search.exaApiKey), "EXA_API_KEY"),
         jinaApiKey: envOr(optionalString(search.jinaApiKey), "JINA_API_KEY"),
-        searxngUrl: optionalString(search.searxngUrl) ?? optionalString(process.env.SEARXNG_URL),
+        searxngUrl,
         timeoutMs: positiveInt(search.timeoutMs, DEFAULT_WEB_TIMEOUT_MS, 1000, 60_000),
         maxResults: positiveInt(search.maxResults, DEFAULT_SEARCH_RESULTS, 1, 20),
       },
@@ -237,7 +300,10 @@ export function loadConfig(cwd: string = process.cwd()): ResolvedConfig {
   const warnings: string[] = [];
   const userRaw = readJsonFile(getUserConfigPath(), warnings);
   const projectRaw = readJsonFile(getProjectConfigPath(cwd), warnings);
-  const merged = mergeFiles(mergeFiles(DEFAULTS, asFile(userRaw)), asFile(projectRaw));
+  const merged = mergeFiles(
+    mergeFiles(DEFAULTS, asFile(userRaw, getUserConfigPath(), warnings)),
+    asFile(projectRaw, getProjectConfigPath(cwd), warnings),
+  );
   return resolveConfig(merged, warnings);
 }
 
@@ -257,11 +323,22 @@ export function ensureDir(dir: string, mode = 0o700): void {
   }
 }
 
+let tmpCounter = 0;
+
 export function writePrivateFile(filePath: string, contents: string): void {
   ensureDir(path.dirname(filePath));
-  const tmp = `${filePath}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, contents, { encoding: "utf8", mode: 0o600 });
-  fs.renameSync(tmp, filePath);
+  const tmp = `${filePath}.${process.pid}.${tmpCounter++}.tmp`;
+  try {
+    fs.writeFileSync(tmp, contents, { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tmp, filePath);
+  } catch (error) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      // Best-effort cleanup of the partial temp file.
+    }
+    throw error;
+  }
   try {
     fs.chmodSync(filePath, 0o600);
   } catch {

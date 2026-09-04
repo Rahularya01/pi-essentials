@@ -10,7 +10,7 @@ import { interpolateEnvValue, interpolateRecord, timeoutSignal } from "../securi
 import { CONNECT_TIMEOUT_MS, MAX_TOOL_RESULT_CHARS } from "../security/limits.ts";
 import { loadMcpServers, serverTransport } from "./config.ts";
 import { FileOAuthProvider, maybeOpenUrl, startLoopbackCallback } from "./oauth.ts";
-import type { CachedTool, ResolvedServer, ServerSnapshot, ServerStatus } from "./types.ts";
+import type { CachedTool, McpFileShape, ResolvedServer, ServerSnapshot, ServerStatus } from "./types.ts";
 
 interface LiveConnection {
   client: Client;
@@ -26,6 +26,8 @@ interface ServerState {
   tools: CachedTool[];
   live?: LiveConnection;
   connectPromise?: Promise<void>;
+  /** Set once automatic discovery has tried this server, so it is not retried on every call. */
+  discovered?: boolean;
 }
 
 function globMatch(pattern: string, value: string): boolean {
@@ -62,11 +64,12 @@ function envRecord(env: NodeJS.ProcessEnv): Record<string, string> {
 
 function httpStatus(error: unknown): number | undefined {
   if (!error || typeof error !== "object") return undefined;
-  const anyErr = error as { status?: unknown; code?: unknown; cause?: unknown };
+  const anyErr = error as { status?: unknown; code?: unknown };
   if (typeof anyErr.status === "number") return anyErr.status;
   if (typeof anyErr.code === "number") return anyErr.code;
-  const message = errorMessage(error);
-  const match = message.match(/\b(404|405|406|415)\b/);
+  // Only trust a status read out of the message when it is phrased as one, so an
+  // unrelated "404" inside a server's prose does not trigger the SSE fallback.
+  const match = /\b(?:HTTP|status(?: code)?:?)\s*(\d{3})\b/i.exec(errorMessage(error));
   return match ? Number(match[1]) : undefined;
 }
 
@@ -75,9 +78,43 @@ function needsSseFallback(error: unknown): boolean {
   return status === 404 || status === 405 || status === 406 || status === 415;
 }
 
+/** Longest inline value kept for a non-text content part before summarizing it. */
+const MAX_INLINE_PART_CHARS = 2000;
+
+function describeContentPart(item: Record<string, unknown>): string {
+  const type = typeof item.type === "string" ? item.type : "unknown";
+
+  // Binary payloads (screenshots, audio) must never be pasted into the parent
+  // context: a single base64 image can be megabytes of unreadable tokens.
+  if (typeof item.data === "string") {
+    const mime = typeof item.mimeType === "string" ? item.mimeType : "application/octet-stream";
+    const kb = Math.round((item.data.length * 3) / 4 / 1024);
+    return `[${type} content omitted: ${mime}, ~${kb} KB base64]`;
+  }
+  if (type === "resource" || type === "resource_link") {
+    const resource = (item.resource ?? item) as Record<string, unknown>;
+    if (typeof resource.text === "string") return resource.text;
+    if (typeof resource.blob === "string") {
+      const mime = typeof resource.mimeType === "string" ? resource.mimeType : "application/octet-stream";
+      return `[resource omitted: ${String(resource.uri ?? "unknown")} (${mime})]`;
+    }
+    return `[resource: ${String(resource.uri ?? "unknown")}]`;
+  }
+  try {
+    const json = JSON.stringify(item);
+    return json.length > MAX_INLINE_PART_CHARS
+      ? `${json.slice(0, MAX_INLINE_PART_CHARS)}… [${json.length - MAX_INLINE_PART_CHARS} more characters omitted]`
+      : json;
+  } catch {
+    return `[unserializable ${type} content]`;
+  }
+}
+
 function stringifyToolResult(result: unknown): string {
   if (!result || typeof result !== "object") return String(result ?? "");
-  const content = (result as { content?: unknown }).content;
+  const record = result as { content?: unknown; structuredContent?: unknown; isError?: boolean };
+  const content = record.content;
+
   if (!Array.isArray(content)) {
     try {
       return JSON.stringify(result, null, 2);
@@ -85,35 +122,69 @@ function stringifyToolResult(result: unknown): string {
       return String(result);
     }
   }
+
   const parts: string[] = [];
+  const textJson = new Set<string>();
   for (const item of content) {
     if (!item || typeof item !== "object") continue;
-    const rec = item as { type?: unknown; text?: unknown };
-    if (rec.type === "text" && typeof rec.text === "string") parts.push(rec.text);
-    else {
+    const rec = item as Record<string, unknown>;
+    if (rec.type === "text" && typeof rec.text === "string") {
+      parts.push(rec.text);
       try {
-        parts.push(JSON.stringify(item));
+        textJson.add(JSON.stringify(JSON.parse(rec.text)));
       } catch {
-        parts.push(String(item));
+        // Ordinary prose is not a structured-content duplicate.
       }
+    } else parts.push(describeContentPart(rec));
+  }
+
+  if (record.structuredContent !== undefined) {
+    try {
+      const compact = JSON.stringify(record.structuredContent);
+      // Some MCP servers mirror structuredContent into a JSON text part. Keep
+      // both kinds of output, but do not paste the same JSON into context twice.
+      if (!textJson.has(compact)) parts.push(JSON.stringify(record.structuredContent, null, 2));
+    } catch {
+      // Ignore an unserializable structured value; content parts remain useful.
     }
   }
-  if ((result as { isError?: boolean }).isError) {
-    return parts.join("\n") || "MCP tool returned an error.";
-  }
+
+  if (record.isError) return parts.join("\n") || "MCP tool returned an error.";
   return parts.join("\n\n") || "(empty MCP result)";
 }
+
+function mcpResultError(result: unknown): PiEssentialsError | undefined {
+  if (!result || typeof result !== "object" || !(result as { isError?: unknown }).isError) return undefined;
+  return new PiEssentialsError(stringifyToolResult(result), "MCP_TOOL_ERROR");
+}
+
+function resolveTool(tools: CachedTool[], name: string): CachedTool | undefined {
+  const prefixed = tools.find((tool) => tool.prefixedName === name);
+  if (prefixed) return prefixed;
+  const unprefixed = tools.filter((tool) => tool.name === name);
+  if (unprefixed.length <= 1) return unprefixed[0];
+  throw new PiEssentialsError(
+    `Ambiguous MCP tool "${name}". Use a prefixed tool name: ${unprefixed.map((tool) => tool.prefixedName).join(", ")}.`,
+    "MCP_AMBIGUOUS_TOOL",
+  );
+}
+
+export const __testing = { stringifyToolResult, mcpResultError, resolveTool, httpStatus };
 
 export class McpManager {
   private readonly states = new Map<string, ServerState>();
   private closed = false;
+  /** Config problems surfaced through the UI at session start, not the console. */
+  readonly warnings: string[] = [];
+  private readonly fileSettings: McpFileShape["settings"];
 
   constructor(
     private readonly cwd: string,
     private readonly config: ResolvedConfig,
   ) {
-    const { servers, warnings } = loadMcpServers(cwd);
-    for (const warning of warnings) console.warn(`[pi-essentials] ${warning}`);
+    const { servers, warnings, settings } = loadMcpServers(cwd);
+    this.warnings.push(...warnings);
+    this.fileSettings = settings;
     for (const server of servers) {
       this.states.set(server.name, {
         server,
@@ -121,6 +192,24 @@ export class McpManager {
         tools: [],
       });
     }
+  }
+
+  /** Allow a manager to be reused after `shutdown()` (for example across /reload). */
+  reset(): void {
+    this.closed = false;
+    for (const state of this.states.values()) state.discovered = false;
+  }
+
+  private requestTimeoutFor(state: ServerState): number {
+    return (
+      state.server.definition.requestTimeoutMs ?? this.fileSettings?.requestTimeoutMs ?? this.config.mcp.requestTimeoutMs
+    );
+  }
+
+  private idleTimeoutFor(state: ServerState): number {
+    const minutes = state.server.definition.idleTimeout ?? this.fileSettings?.idleTimeout;
+    if (minutes && minutes > 0) return minutes * 60_000;
+    return this.config.mcp.idleTimeoutMs;
   }
 
   listServers(): ServerSnapshot[] {
@@ -140,8 +229,7 @@ export class McpManager {
   }
 
   findTool(name: string): CachedTool | undefined {
-    const tools = this.allCachedTools();
-    return tools.find((t) => t.prefixedName === name || t.name === name);
+    return resolveTool(this.allCachedTools(), name);
   }
 
   searchTools(query: string): CachedTool[] {
@@ -186,11 +274,13 @@ export class McpManager {
       return;
     }
     if (state.connectPromise && !force) return state.connectPromise;
-    state.connectPromise = this.connectInternal(state, signal);
+    const attempt = this.connectInternal(state, signal);
+    state.connectPromise = attempt;
     try {
-      await state.connectPromise;
+      await attempt;
     } finally {
-      state.connectPromise = undefined;
+      // A concurrent force-reconnect may already have installed a newer attempt.
+      if (state.connectPromise === attempt) state.connectPromise = undefined;
     }
   }
 
@@ -204,15 +294,42 @@ export class McpManager {
     await this.disconnect();
   }
 
+  /** Force a reconnect of every enabled server (used by /mcp reconnect). */
   async refreshAll(signal?: AbortSignal): Promise<void> {
-    for (const state of this.states.values()) {
-      if (state.status === "disabled") continue;
-      try {
-        await this.connect(state.server.name, signal, true);
-      } catch {
-        // status already recorded
-      }
-    }
+    await Promise.all(
+      [...this.states.values()]
+        .filter((state) => state.status !== "disabled")
+        .map((state) => {
+          state.discovered = false;
+          return this.connect(state.server.name, signal, true).catch(() => undefined);
+        }),
+    );
+  }
+
+  /**
+   * Make sure every enabled server has been listed at least once. Servers that
+   * already have cached tools are left alone, so discovery does not tear down
+   * healthy connections.
+   */
+  async ensureAllTools(signal?: AbortSignal): Promise<void> {
+    const pending = [...this.states.values()].filter(
+      (state) => state.status !== "disabled" && state.tools.length === 0 && !state.discovered,
+    );
+    await Promise.all(
+      pending.map(async (state) => {
+        // Mark first: a server that fails or exposes no tools must not be retried
+        // on every subsequent search/list/describe call.
+        state.discovered = true;
+        await this.connect(state.server.name, signal).catch(() => undefined);
+      }),
+    );
+  }
+
+  /** Human-readable reasons why discovery produced no tools. */
+  discoveryProblems(): string[] {
+    return this.listServers()
+      .filter((row) => row.status === "failed" || row.status === "needs-auth")
+      .map((row) => `${row.name}: ${row.status}${row.error ? ` — ${row.error}` : ""}`);
   }
 
   async callTool(prefixedOrName: string, args: unknown, signal?: AbortSignal): Promise<string> {
@@ -228,7 +345,7 @@ export class McpManager {
     await this.connect(serverName, signal);
     const state = this.requireServer(serverName);
     if (!state.live) throw new PiEssentialsError(`MCP server "${serverName}" is not connected.`, "MCP_NOT_CONNECTED");
-    const timeoutMs = state.server.definition.requestTimeoutMs ?? this.config.mcp.requestTimeoutMs;
+    const timeoutMs = this.requestTimeoutFor(state);
     const combined = timeoutSignal(timeoutMs, signal);
     try {
       const result = await state.live.client.callTool({ name, arguments: parseMcpArgs(args) }, undefined, {
@@ -237,6 +354,8 @@ export class McpManager {
       });
       state.live.lastUsed = Date.now();
       this.scheduleIdle(state);
+      const failure = mcpResultError(result);
+      if (failure) throw failure;
       const text = stringifyToolResult(result);
       return capText(text, MAX_TOOL_RESULT_CHARS).text;
     } catch (error) {
@@ -276,6 +395,7 @@ export class McpManager {
       const opened = await maybeOpenUrl(authorize.toString());
       const callback = await loopback.waitForCallback(5 * 60_000);
       await this.finishAuthOnProvider(state, provider, callback, signal);
+      state.discovered = false;
       return opened
         ? `Authenticated with "${name}".`
         : `Authenticated with "${name}". Authorization URL was: ${authorize.toString()}`;
@@ -289,12 +409,20 @@ export class McpManager {
     if (rows.length === 0) {
       return "No MCP servers configured. Add servers to .mcp.json or ~/.pi/agent/mcp.json.";
     }
-    return rows
-      .map((row) => {
-        const extra = row.error ? ` — ${row.error}` : "";
-        return `${row.name}  ${row.status}  ${row.transport}  tools:${row.toolCount}  (${row.source})${extra}`;
-      })
-      .join("\n");
+    const width = (pick: (row: ServerSnapshot) => string) => Math.max(...rows.map((row) => pick(row).length));
+    const nameWidth = Math.max(6, width((row) => row.name));
+    const statusWidth = Math.max(6, width((row) => row.status));
+    const header = `${"SERVER".padEnd(nameWidth)}  ${"STATUS".padEnd(statusWidth)}  TRANSPORT  TOOLS  SOURCE`;
+    const body = rows.map((row) => {
+      const extra = row.error ? `\n${" ".repeat(nameWidth + 2)}└─ ${row.error}` : "";
+      return (
+        `${row.name.padEnd(nameWidth)}  ${row.status.padEnd(statusWidth)}  ${row.transport.padEnd(9)}  ` +
+        `${String(row.toolCount).padStart(5)}  ${row.source}${extra}`
+      );
+    });
+    const lazy = rows.some((row) => row.status === "idle" && row.toolCount === 0);
+    const hint = lazy ? "\n\nLazy servers list their tools on first use; run /mcp reconnect to connect now." : "";
+    return `${header}\n${body.join("\n")}${hint}`;
   }
 
   private async finishExistingAuth(state: ServerState, redirectUrl: string, signal?: AbortSignal): Promise<string> {
@@ -303,6 +431,7 @@ export class McpManager {
     const provider = this.createOAuthProvider(state, redirectUri);
     await this.connectWithProvider(state, provider, signal, true);
     await this.finishAuthOnProvider(state, provider, url, signal);
+    state.discovered = false;
     return `Authenticated with "${state.server.name}".`;
   }
 
@@ -312,6 +441,11 @@ export class McpManager {
     callbackUrl: URL,
     signal?: AbortSignal,
   ): Promise<void> {
+    const denied = callbackUrl.searchParams.get("error");
+    if (denied) {
+      const detail = callbackUrl.searchParams.get("error_description") ?? denied;
+      throw new PiEssentialsError(`OAuth was denied by the provider: ${detail}`, "MCP_OAUTH_FAILED");
+    }
     const code = callbackUrl.searchParams.get("code");
     if (!code) throw new PiEssentialsError("OAuth callback did not include an authorization code.", "MCP_OAUTH_FAILED");
     const transport = await this.createHttpTransport(state, provider);
@@ -504,7 +638,7 @@ export class McpManager {
 
   private async refreshTools(state: ServerState, signal?: AbortSignal): Promise<void> {
     if (!state.live) return;
-    const timeoutMs = state.server.definition.requestTimeoutMs ?? this.config.mcp.requestTimeoutMs;
+    const timeoutMs = this.requestTimeoutFor(state);
     const tools: CachedTool[] = [];
     let cursor: string | undefined;
     do {
@@ -530,21 +664,20 @@ export class McpManager {
 
   private scheduleIdle(state: ServerState): void {
     if (state.live?.idleTimer) clearTimeout(state.live.idleTimer);
-    const lifecycle = state.server.definition.lifecycle ?? "lazy";
-    if (lifecycle === "keep-alive") return;
-    const minutes = state.server.definition.idleTimeout;
-    const idleMs = minutes && minutes > 0 ? minutes * 60_000 : this.config.mcp.idleTimeoutMs;
     if (!state.live) return;
+    if ((state.server.definition.lifecycle ?? "lazy") === "keep-alive") return;
     state.live.idleTimer = setTimeout(() => {
       void this.disconnectState(state);
-    }, idleMs);
+    }, this.idleTimeoutFor(state));
     state.live.idleTimer.unref?.();
   }
 
   private async disconnectState(state: ServerState): Promise<void> {
     const live = state.live;
     state.live = undefined;
-    if (state.status !== "disabled") state.status = state.tools.length > 0 ? "idle" : "idle";
+    // "disabled", "failed" and "needs-auth" describe the server, not the socket,
+    // so only a live/connecting server falls back to "idle".
+    if (state.status === "connected" || state.status === "connecting") state.status = "idle";
     if (!live) return;
     if (live.idleTimer) clearTimeout(live.idleTimer);
     try {
@@ -569,10 +702,14 @@ export class McpManager {
   }
 
   private guessServer(toolName: string): string | undefined {
+    let best: { name: string; length: number } | undefined;
     for (const state of this.states.values()) {
-      if (toolName.startsWith(`${state.server.name.replace(/[^A-Za-z0-9_]+/g, "_")}_`)) return state.server.name;
+      const prefix = `${state.server.name.replace(/[^A-Za-z0-9_]+/g, "_")}_`;
+      if (!toolName.startsWith(prefix)) continue;
+      // "a_b" and "a" both prefix "a_b_c"; the longer match is the real server.
+      if (!best || prefix.length > best.length) best = { name: state.server.name, length: prefix.length };
     }
-    return undefined;
+    return best?.name;
   }
 
   private wrapCallError(server: string, error: unknown): PiEssentialsError {

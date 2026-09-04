@@ -1,8 +1,16 @@
 {
+  "settings": {
+    "requestTimeoutMs": 30000,
+    "idleTimeout": 10
+  },
   "mcpServers": {
     "filesystem": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/tmp"
+      ],
       "lifecycle": "lazy"
     },
     "remote-docs": {
@@ -11,7 +19,7 @@
         "Authorization": "Bearer ${MCP_DOCS_TOKEN}"
       },
       "auth": "bearer",
-      "requestTimeoutMs": 30000
+      "requestTimeoutMs": 45000
     },
     "linear": {
       "url": "https://mcp.linear.app/mcp",

@@ -1,28 +1,29 @@
 import { safeFetch } from "../http.ts";
-import type { SearchFn, SearchHit } from "./types.ts";
+import { parseJson, SEARCH_MAX_BYTES, toHits, type SearchFn } from "./types.ts";
 
 export function searchSearxng(baseUrl: string): SearchFn {
-  return async (query, count, signal) => {
-    const root = baseUrl.replace(/\/+$/, "");
-    const url = `${root}/search?q=${encodeURIComponent(query)}&format=json`;
-    const response = await safeFetch(url, {
-      timeoutMs: 15_000,
-      maxBytes: 512_000,
+  return async ({ query, count, timeoutMs, signal, allowedHosts }) => {
+    const url = new URL(baseUrl);
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/search`;
+    url.search = "";
+    url.hash = "";
+    url.searchParams.set("q", query);
+    url.searchParams.set("format", "json");
+    const response = await safeFetch(url.toString(), {
+      timeoutMs,
+      maxBytes: SEARCH_MAX_BYTES,
       signal,
+      allowedHosts,
       headers: { accept: "application/json" },
     });
-    const json = JSON.parse(response.text()) as {
+    const json = parseJson<{
       results?: Array<{ title?: string; url?: string; content?: string }>;
-    };
-    const hits: SearchHit[] = (json.results ?? [])
-      .filter((r) => r.url && r.title)
-      .slice(0, count)
-      .map((r) => ({
-        title: r.title ?? "",
-        url: r.url ?? "",
-        snippet: r.content ?? "",
-        source: "searxng",
-      }));
+    }>(response.text(), "SearXNG");
+    const hits = toHits(
+      (json.results ?? []).map((r) => ({ title: r.title, url: r.url, snippet: r.content })),
+      count,
+      "searxng",
+    );
     return { provider: "searxng", query, hits };
   };
 }

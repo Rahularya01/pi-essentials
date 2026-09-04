@@ -123,64 +123,94 @@ export class FileOAuthProvider implements OAuthClientProvider {
   }
 }
 
-export function startLoopbackCallback(preferredPort = 0): Promise<{
+export interface LoopbackCallback {
   redirectUri: string;
   waitForCallback: (timeoutMs: number) => Promise<URL>;
   close: () => void;
-}> {
+}
+
+const CALLBACK_PAGE = (message: string) =>
+  `<!doctype html><meta charset="utf-8"><title>Pi</title>` +
+  `<body style="font-family:system-ui;padding:2rem"><p>${message}</p></body>`;
+
+export function startLoopbackCallback(preferredPort = 0): Promise<LoopbackCallback> {
   return new Promise((resolve, reject) => {
     const server = http.createServer();
+    const sockets = new Set<import("node:net").Socket>();
     const waiters: Array<(url: URL) => void> = [];
     let received: URL | undefined;
 
+    // Keep-alive sockets would otherwise block server.close().
+    server.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.on("close", () => sockets.delete(socket));
+    });
+
     server.on("request", (req, res) => {
+      let url: URL;
       try {
-        const host = req.headers.host ?? "127.0.0.1";
-        const url = new URL(req.url ?? "/", `http://${host}`);
-        if (url.pathname !== "/callback") {
-          res.statusCode = 404;
-          res.end("Not found");
-          return;
-        }
-        received = url;
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "text/html; charset=utf-8");
-        res.end("<html><body><p>Authentication complete. You can return to Pi.</p></body></html>");
-        for (const waiter of waiters.splice(0)) waiter(url);
+        url = new URL(req.url ?? "/", "http://127.0.0.1");
       } catch {
         res.statusCode = 400;
         res.end("Bad request");
+        return;
       }
+      if (url.pathname !== "/callback") {
+        res.statusCode = 404;
+        res.end("Not found");
+        return;
+      }
+      const oauthError = url.searchParams.get("error");
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.end(
+        CALLBACK_PAGE(
+          oauthError
+            ? `Authorization failed: ${escapeHtml(url.searchParams.get("error_description") ?? oauthError)}`
+            : "Authentication complete. You can return to Pi.",
+        ),
+      );
+      received = url;
+      for (const waiter of waiters.splice(0)) waiter(url);
     });
 
-    server.on("error", reject);
+    server.once("error", reject);
     server.listen(preferredPort, "127.0.0.1", () => {
       const address = server.address();
       if (!address || typeof address === "string") {
-        reject(new Error("Failed to bind OAuth callback server"));
+        reject(new Error("Failed to bind the OAuth callback server on 127.0.0.1"));
         return;
       }
-      const redirectUri = `http://127.0.0.1:${address.port}/callback`;
       resolve({
-        redirectUri,
+        redirectUri: `http://127.0.0.1:${address.port}/callback`,
         waitForCallback: (timeoutMs: number) =>
           new Promise<URL>((resWait, rejWait) => {
             if (received) {
               resWait(received);
               return;
             }
-            const timer = setTimeout(() => rejWait(new Error("Timed out waiting for OAuth callback")), timeoutMs);
+            const timer = setTimeout(
+              () => rejWait(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the OAuth callback.`)),
+              timeoutMs,
+            );
+            timer.unref?.();
             waiters.push((url) => {
               clearTimeout(timer);
               resWait(url);
             });
           }),
         close: () => {
+          for (const socket of sockets) socket.destroy();
+          sockets.clear();
           server.close();
         },
       });
     });
   });
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => `&#${char.charCodeAt(0)};`);
 }
 
 export async function maybeOpenUrl(url: string): Promise<boolean> {

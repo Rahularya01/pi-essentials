@@ -8,8 +8,7 @@ Requires Node.js 22+.
 
 ```bash
 npm install
-npm test
-npm run typecheck
+npm run check    # typecheck + tests
 ```
 
 Load a local checkout in Pi:
@@ -32,7 +31,7 @@ Then restart Pi or run `/reload`.
 
 1. Fork the repository and create a branch from `main`.
 2. Make a focused change.
-3. Run `npm test` and `npm run typecheck`.
+3. Run `npm run check`.
 4. Open a PR against `main` with a short summary of why the change is needed.
 
 By contributing, you agree that your contributions are licensed under the MIT License.

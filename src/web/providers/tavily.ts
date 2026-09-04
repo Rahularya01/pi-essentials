@@ -1,28 +1,31 @@
 import { safeFetch } from "../http.ts";
-import type { SearchFn, SearchHit } from "./types.ts";
+import { parseJson, SEARCH_MAX_BYTES, toHits, type SearchFn } from "./types.ts";
 
 export function searchTavily(apiKey: string): SearchFn {
-  return async (query, count, signal) => {
+  return async ({ query, count, timeoutMs, signal, allowedHosts }) => {
     const response = await safeFetch("https://api.tavily.com/search", {
-      timeoutMs: 20_000,
-      maxBytes: 512_000,
+      timeoutMs,
+      maxBytes: SEARCH_MAX_BYTES,
       signal,
+      allowedHosts,
       method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      // `api_key` is Tavily's legacy field and the Bearer header is the current
+      // form; sending both keeps old and new deployments working.
       body: JSON.stringify({ api_key: apiKey, query, max_results: count, search_depth: "basic" }),
     });
-    const json = JSON.parse(response.text()) as {
+    const json = parseJson<{
       results?: Array<{ title?: string; url?: string; content?: string }>;
-    };
-    const hits: SearchHit[] = (json.results ?? [])
-      .filter((r) => r.url && r.title)
-      .slice(0, count)
-      .map((r) => ({
-        title: r.title ?? "",
-        url: r.url ?? "",
-        snippet: r.content ?? "",
-        source: "tavily",
-      }));
+    }>(response.text(), "Tavily");
+    const hits = toHits(
+      (json.results ?? []).map((r) => ({ title: r.title, url: r.url, snippet: r.content })),
+      count,
+      "tavily",
+    );
     return { provider: "tavily", query, hits };
   };
 }

@@ -3,9 +3,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ResolvedSubagentsConfig } from "../config.ts";
-import { capText } from "../errors.ts";
+import { capBytes } from "../errors.ts";
 import { sanitizeEnv } from "../security/env.ts";
+import type { JsonSchema } from "./schema.ts";
 import type { AgentDefinition } from "./types.ts";
+import type { WorktreeMetadata } from "./worktree.ts";
+
+/** Grace period between SIGTERM and SIGKILL when a run is cancelled. */
+const KILL_GRACE_MS = 5_000;
 
 export interface RunUsage {
   input: number;
@@ -13,6 +18,10 @@ export interface RunUsage {
   cacheRead: number;
   cacheWrite: number;
   cost: number;
+  costInput?: number;
+  costOutput?: number;
+  costCacheRead?: number;
+  costCacheWrite?: number;
   turns: number;
 }
 
@@ -22,11 +31,15 @@ export interface SubagentRunResult {
   task: string;
   exitCode: number;
   output: string;
+  structuredOutput?: unknown;
+  outputKind: "text" | "structured";
   stderr: string;
   usage: RunUsage;
+  worktree?: WorktreeMetadata;
   model?: string;
   error?: string;
   running: boolean;
+  durationMs: number;
 }
 
 export interface ActiveRun {
@@ -37,49 +50,143 @@ export interface ActiveRun {
   proc?: ReturnType<typeof spawn>;
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
+let runCounter = 0;
+
+export function emptyUsage(): RunUsage {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0,
+    costInput: 0,
+    costOutput: 0,
+    costCacheRead: 0,
+    costCacheWrite: 0,
+    turns: 0,
+  };
+}
+
+/**
+ * Resolve `pi` on PATH ourselves. `spawn` does no PATHEXT resolution and refuses
+ * to run `.cmd`/`.bat` without a shell, which we will not use for untrusted text.
+ */
+export function resolveOnPath(name: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const dirs = (env.PATH ?? env.Path ?? "").split(path.delimiter).filter(Boolean);
+  const extensions =
+    process.platform === "win32" ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
+  for (const dir of dirs) {
+    for (const ext of extensions) {
+      const candidate = path.join(dir, `${name}${ext}`);
+      try {
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // Not here; keep looking.
+      }
+    }
+  }
+  return undefined;
+}
+
+export function getPiInvocation(args: string[]): { command: string; args: string[] } {
   const currentScript = process.argv[1];
   const isBunVirtual = currentScript?.startsWith("/$bunfs/root/");
+  // Preferred: re-run the exact script this process was started from.
   if (currentScript && !isBunVirtual && fs.existsSync(currentScript)) {
     return { command: process.execPath, args: [currentScript, ...args] };
   }
+  // A compiled pi binary: re-exec it directly.
   const execName = path.basename(process.execPath).toLowerCase();
   if (!/^(node|bun)(\.exe)?$/.test(execName)) {
     return { command: process.execPath, args };
   }
-  return { command: "pi", args };
+  return { command: resolveOnPath("pi") ?? "pi", args };
 }
 
 function writePrompt(agentName: string, prompt: string): { dir: string; file: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-essentials-subagent-"));
-  const file = path.join(dir, `${agentName.replace(/[^\w.-]+/g, "_")}.md`);
+  const file = path.join(dir, `${agentName.replace(/[^\w.-]+/g, "_") || "agent"}.md`);
   fs.writeFileSync(file, prompt, { encoding: "utf8", mode: 0o600 });
   return { dir, file };
 }
 
-function cleanupPrompt(dir: string, file: string): void {
+export function buildResultExtension(schema: JsonSchema): string {
+  return `import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";\n\nconst schema = ${JSON.stringify(schema)} as any;\n\nexport default function (pi: ExtensionAPI) {\n  pi.registerTool({\n    name: "subagent_result",\n    label: "Subagent Result",\n    description: "Submit the final structured result. This must be your final action.",\n    parameters: schema,\n    async execute(_id, params) {\n      return { content: [{ type: "text", text: JSON.stringify(params) }], details: params, terminate: true };\n    },\n  });\n}\n`;
+}
+
+function cleanupPrompt(dir: string): void {
   try {
-    fs.unlinkSync(file);
+    fs.rmSync(dir, { recursive: true, force: true });
   } catch {
-    // ignore
-  }
-  try {
-    fs.rmdirSync(dir);
-  } catch {
-    // ignore
+    // Best-effort; the OS reclaims the temp directory anyway.
   }
 }
 
-function finalAssistantText(messages: Array<{ role?: string; content?: unknown }>): string {
+export function finalAssistantText(messages: Array<{ role?: string; content?: unknown }>): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
     const texts = msg.content
-      .filter((part): part is { type: string; text: string } => Boolean(part) && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")
-      .map((part) => part.text);
+      .filter(
+        (part): part is { type: string; text: string } =>
+          Boolean(part) &&
+          typeof part === "object" &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string",
+      )
+      .map((part) => part.text.trim())
+      .filter(Boolean);
     if (texts.length > 0) return texts.join("\n");
   }
   return "";
+}
+
+interface JsonUsage {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+}
+
+/** Accumulate pi's JSON-mode usage, whose cost lives under `usage.cost.total`. */
+export function accumulateUsage(usage: RunUsage, reported: JsonUsage | undefined): void {
+  if (!reported) return;
+  usage.input += reported.input ?? 0;
+  usage.output += reported.output ?? 0;
+  usage.cacheRead += reported.cacheRead ?? 0;
+  usage.cacheWrite += reported.cacheWrite ?? 0;
+  usage.cost += reported.cost?.total ?? 0;
+  usage.costInput = (usage.costInput ?? 0) + (reported.cost?.input ?? 0);
+  usage.costOutput = (usage.costOutput ?? 0) + (reported.cost?.output ?? 0);
+  usage.costCacheRead = (usage.costCacheRead ?? 0) + (reported.cost?.cacheRead ?? 0);
+  usage.costCacheWrite = (usage.costCacheWrite ?? 0) + (reported.cost?.cacheWrite ?? 0);
+}
+
+export function buildArgs(options: {
+  agent: AgentDefinition;
+  model?: string;
+  thinkingLevel?: string;
+  promptFile?: string;
+  extensionFile?: string;
+  structured?: boolean;
+  task: string;
+}): string[] {
+  const args = ["--mode", "json", "--no-session"];
+  const model = options.agent.model ?? options.model;
+  if (model) args.push("--model", model);
+  if (options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
+  if (options.extensionFile) args.push("--extension", options.extensionFile);
+  if (options.agent.tools?.length) {
+    const tools = options.structured
+      ? [...new Set([...options.agent.tools, "subagent_result"])]
+      : options.agent.tools;
+    args.push("--tools", tools.join(","));
+  }
+  if (options.promptFile) args.push("--append-system-prompt", options.promptFile);
+  // `--` stops flag parsing so a task starting with "-" is still treated as a prompt.
+  args.push("--", `Task: ${options.task}`);
+  return args;
 }
 
 export async function runSubagent(options: {
@@ -91,50 +198,89 @@ export async function runSubagent(options: {
   config: ResolvedSubagentsConfig;
   signal?: AbortSignal;
   envExtra?: Record<string, string>;
+  outputSchema?: JsonSchema;
   onProgress?: (partial: string) => void;
   register?: (run: ActiveRun) => void;
   unregister?: (id: string) => void;
 }): Promise<SubagentRunResult> {
-  const id = `${options.agent.name}-${Date.now().toString(36)}`;
-  const args = ["--mode", "json", "-p", "--no-session"];
-  const model = options.agent.model ?? options.model;
-  if (model) args.push("--model", model);
-  if (!options.agent.model && options.thinkingLevel) args.push("--thinking", options.thinkingLevel);
-  if (options.agent.tools?.length) args.push("--tools", options.agent.tools.join(","));
+  const startedAt = Date.now();
+  const id = `${options.agent.name}-${(runCounter++).toString(36)}${startedAt.toString(36).slice(-4)}`;
 
   let promptDir: string | undefined;
   let promptFile: string | undefined;
-  if (options.agent.systemPrompt.trim()) {
-    const written = writePrompt(options.agent.name, options.agent.systemPrompt);
-    promptDir = written.dir;
-    promptFile = written.file;
-    args.push("--append-system-prompt", promptFile);
+  const structuredGuidance = options.outputSchema
+    ? "\n\nYou MUST finish by calling subagent_result exactly once with the final answer. Do not merely print JSON."
+    : "";
+  const systemPrompt = `${options.agent.systemPrompt}${structuredGuidance}`;
+  if (systemPrompt.trim()) {
+    try {
+      const written = writePrompt(options.agent.name, systemPrompt);
+      promptDir = written.dir;
+      promptFile = written.file;
+    } catch {
+      // Fall back to passing the prompt inline; pi accepts text or a file path.
+      promptFile = systemPrompt;
+    }
   }
-  args.push(`Task: ${options.task}`);
 
-  const usage: RunUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+  let extensionFile: string | undefined;
+  if (options.outputSchema) {
+    if (!promptDir) promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-essentials-subagent-"));
+    extensionFile = path.join(promptDir, "structured-result.ts");
+    fs.writeFileSync(extensionFile, buildResultExtension(options.outputSchema), { encoding: "utf8", mode: 0o600 });
+  }
+
+  const args = buildArgs({
+    agent: options.agent,
+    model: options.model,
+    // An agent that pins its own model should not inherit the parent's thinking level.
+    thinkingLevel: options.agent.model ? undefined : options.thinkingLevel,
+    promptFile,
+    extensionFile,
+    structured: Boolean(options.outputSchema),
+    task: options.task,
+  });
+
+  const usage = emptyUsage();
   const messages: Array<{ role?: string; content?: unknown }> = [];
   let stderr = "";
-  let childModel = model;
+  let childModel = options.agent.model ?? options.model;
   let error: string | undefined;
+  let structuredOutput: unknown;
+  let successfulResultCalls = 0;
 
   const invocation = getPiInvocation(args);
   const env = sanitizeEnv(process.env, {
     PI_ESSENTIALS_SUBAGENT: "1",
-    PI_ESSENTIALS_NEST_DEPTH: String(Number(process.env.PI_ESSENTIALS_NEST_DEPTH ?? "0") + 1),
+    PI_ESSENTIALS_NEST_DEPTH: String(Math.max(0, Number.parseInt(process.env.PI_ESSENTIALS_NEST_DEPTH ?? "0", 10) || 0) + 1),
     ...options.envExtra,
   });
 
-  const result = await new Promise<number>((resolve) => {
-    const proc = spawn(invocation.command, invocation.args, {
-      cwd: options.cwd,
-      env,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    options.register?.({ id, agent: options.agent.name, task: options.task, startedAt: Date.now(), proc });
-    let buffer = "";
+  const exitCode = await new Promise<number>((resolve) => {
+    let settled = false;
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      resolve(code);
+    };
 
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn(invocation.command, invocation.args, {
+        cwd: options.cwd,
+        env,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (spawnError) {
+      error = `Could not start "${invocation.command}": ${(spawnError as Error).message}`;
+      finish(1);
+      return;
+    }
+
+    options.register?.({ id, agent: options.agent.name, task: options.task, startedAt, proc });
+
+    let buffer = "";
     const handleLine = (line: string) => {
       if (!line.trim()) return;
       let event: unknown;
@@ -144,77 +290,123 @@ export async function runSubagent(options: {
         return;
       }
       if (!event || typeof event !== "object") return;
-      const rec = event as { type?: string; message?: { role?: string; content?: unknown; usage?: Record<string, number>; model?: string; stopReason?: string; errorMessage?: string; cost?: { total?: number } } };
-      if (rec.type === "message_end" && rec.message) {
-        messages.push(rec.message);
-        if (rec.message.role === "assistant") {
-          usage.turns += 1;
-          const u = rec.message.usage;
-          if (u) {
-            usage.input += u.input ?? 0;
-            usage.output += u.output ?? 0;
-            usage.cacheRead += u.cacheRead ?? 0;
-            usage.cacheWrite += u.cacheWrite ?? 0;
-            usage.cost += rec.message.cost?.total ?? (u as { cost?: number }).cost ?? 0;
-          }
-          if (rec.message.model) childModel = rec.message.model;
-          if (rec.message.errorMessage) error = rec.message.errorMessage;
-        }
-        options.onProgress?.(finalAssistantText(messages) || "(running...)");
+      const rec = event as {
+        type?: string;
+        toolName?: string;
+        isError?: boolean;
+        result?: { details?: unknown };
+        message?: { role?: string; content?: unknown; usage?: JsonUsage; model?: string; errorMessage?: string; stopReason?: string };
+      };
+      if (rec.type === "tool_execution_end" && rec.toolName === "subagent_result" && !rec.isError) {
+        successfulResultCalls += 1;
+        structuredOutput = rec.result?.details;
+        return;
       }
+      if (rec.type !== "message_end" || !rec.message) return;
+      messages.push(rec.message);
+      if (rec.message.role === "assistant") {
+        usage.turns += 1;
+        accumulateUsage(usage, rec.message.usage);
+        if (rec.message.model) childModel = rec.message.model;
+        if (rec.message.errorMessage) error = rec.message.errorMessage;
+        else if (rec.message.stopReason === "error" || rec.message.stopReason === "aborted") {
+          error = `Subagent stopped with reason: ${rec.message.stopReason}.`;
+        }
+      } else if (rec.message.role === "toolResult") {
+        // Tool results can carry usage from grandchildren; preserve it recursively.
+        accumulateUsage(usage, rec.message.usage);
+      }
+      options.onProgress?.(finalAssistantText(messages) || "(running…)");
     };
 
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      buffer += chunk.toString("utf8");
+    proc.stdout?.setEncoding("utf8");
+    proc.stdout?.on("data", (chunk: string) => {
+      buffer += chunk;
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const line of lines) handleLine(line);
     });
-    proc.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
-    proc.on("close", (code) => {
-      if (buffer.trim()) handleLine(buffer);
-      resolve(code ?? 0);
-    });
-    proc.on("error", (err) => {
-      error = err.message;
-      resolve(1);
+    proc.stderr?.setEncoding("utf8");
+    proc.stderr?.on("data", (chunk: string) => {
+      // Keep only the tail; a noisy child must not grow memory without bound.
+      stderr = (stderr + chunk).slice(-8000);
     });
 
-    if (options.signal) {
-      const kill = () => {
-        proc.kill("SIGTERM");
-        setTimeout(() => {
-          if (!proc.killed) proc.kill("SIGKILL");
-        }, 5000).unref();
-      };
-      if (options.signal.aborted) kill();
-      else options.signal.addEventListener("abort", kill, { once: true });
+    let killTimer: NodeJS.Timeout | undefined;
+    const kill = () => {
+      if (proc.exitCode !== null || proc.signalCode !== null) return;
+      proc.kill("SIGTERM");
+      killTimer = setTimeout(() => {
+        if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+      }, KILL_GRACE_MS);
+      killTimer.unref?.();
+    };
+    const signal = options.signal;
+    if (signal) {
+      if (signal.aborted) kill();
+      else signal.addEventListener("abort", kill, { once: true });
     }
+    const detach = () => {
+      if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener("abort", kill);
+    };
+
+    proc.on("close", (code, closeSignal) => {
+      if (buffer.trim()) handleLine(buffer);
+      detach();
+      if (closeSignal && code === null) {
+        error ??= `Subagent was terminated by ${closeSignal}.`;
+        finish(1);
+        return;
+      }
+      finish(code ?? 0);
+    });
+    proc.on("error", (err) => {
+      const message = (err as NodeJS.ErrnoException).code === "ENOENT"
+        ? `Could not find the "pi" executable to run subagents. Ensure pi is on PATH.`
+        : err.message;
+      error = message;
+      detach();
+      finish(1);
+    });
   });
 
   options.unregister?.(id);
-  if (promptDir && promptFile) cleanupPrompt(promptDir, promptFile);
+  if (promptDir) cleanupPrompt(promptDir);
 
-  const output = capText(finalAssistantText(messages) || error || stderr || "(no output)", 32_000).text;
+  const answer = finalAssistantText(messages);
+  if (options.outputSchema && successfulResultCalls === 0) {
+    error ??= "Structured subagent run ended without a successful subagent_result call.";
+  } else if (!options.outputSchema && !answer && !error) {
+    error = stderr.trim()
+      ? `Subagent produced no answer. stderr:\n${stderr.trim()}`
+      : "Subagent completed without an assistant answer.";
+  }
+  const outputKind = options.outputSchema ? "structured" : "text";
+  const authoritativeOutput = options.outputSchema && successfulResultCalls > 0
+    ? JSON.stringify(structuredOutput)
+    : answer;
+  const fallback = error ?? "(no output)";
   return {
     id,
     agent: options.agent.name,
     task: options.task,
-    exitCode: result,
-    output,
-    stderr: stderr.slice(0, 4000),
+    exitCode: error ? (exitCode || 1) : exitCode,
+    output: capBytes(authoritativeOutput || fallback, options.config.maxOutputBytes).text,
+    structuredOutput: options.outputSchema && successfulResultCalls > 0 ? structuredOutput : undefined,
+    outputKind,
+    stderr: stderr.slice(-4000),
     usage,
     model: childModel,
     error,
     running: false,
+    durationMs: Date.now() - startedAt,
   };
 }
 
 export async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
   if (items.length === 0) return [];
-  const concurrency = Math.max(1, Math.min(limit, items.length));
+  const concurrency = Math.max(1, Math.min(Math.floor(limit) || 1, items.length));
   const results = new Array<R>(items.length);
   let next = 0;
   await Promise.all(

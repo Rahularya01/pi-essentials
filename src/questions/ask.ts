@@ -1,78 +1,134 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { formatAnswers, type QuestionAnswer, type QuestionSpec } from "./validate.ts";
+import { isMultiple, type QuestionAnswer, type QuestionOption, type QuestionSpec } from "./validate.ts";
 
-const OTHER = "Type something.";
+const OTHER_LABEL = "Other (type your own answer)";
+const DONE_LABEL = "Done (finish this question)";
 
-export async function askQuestions(ctx: ExtensionContext, questions: QuestionSpec[]): Promise<{
+export interface AskResult {
   answers: QuestionAnswer[];
   cancelled: boolean;
-}> {
-  if (ctx.mode === "rpc") {
-    return askViaHostDialogs(ctx, questions);
-  }
-  if (ctx.mode !== "tui" || !ctx.hasUI) {
-    return { answers: [], cancelled: true };
-  }
+}
+
+/**
+ * Options are shown with a numeric prefix so every entry is unique, which lets the
+ * selection be mapped back by array index instead of by parsing the label text.
+ */
+export function displayOptions(options: QuestionOption[]): string[] {
+  return options.map((option, index) => {
+    const description = option.description?.trim();
+    return `${index + 1}. ${option.label}${description ? ` — ${description}` : ""}`;
+  });
+}
+
+export async function askQuestions(
+  ctx: ExtensionContext,
+  questions: QuestionSpec[],
+  signal?: AbortSignal,
+): Promise<AskResult> {
+  if (!ctx.hasUI) return { answers: [], cancelled: true };
 
   const answers: QuestionAnswer[] = [];
   for (const question of questions) {
-    const labels = [...question.options.map((o) => displayOption(o)), OTHER];
-    const picked = await ctx.ui.select(question.question, labels);
-    if (picked === undefined || picked === null) {
-      return { answers, cancelled: true };
-    }
-    const value = String(picked);
-    if (value === OTHER) {
-      const custom = await ctx.ui.input("Your answer", "");
-      if (custom === undefined || custom === null || !String(custom).trim()) {
-        return { answers, cancelled: true };
-      }
-      answers.push({ question: question.question, header: question.header, selected: [], custom: String(custom).trim() });
+    if (signal?.aborted) return { answers, cancelled: true };
+    const answer = isMultiple(question)
+      ? await askMultiSelect(ctx, question, signal)
+      : await askSingle(ctx, question, signal);
+    if (!answer) return { answers, cancelled: true };
+    answers.push(answer);
+  }
+  return { answers, cancelled: false };
+}
+
+async function askSingle(
+  ctx: ExtensionContext,
+  question: QuestionSpec,
+  signal?: AbortSignal,
+): Promise<QuestionAnswer | undefined> {
+  const labels = [...displayOptions(question.options), ...(question.allowOther === false ? [] : [OTHER_LABEL])];
+  // Pi's select API currently has no initial-index option, so `recommended`
+  // remains metadata and option order/display stay backward compatible.
+  const picked = await ctx.ui.select(question.question, labels, { signal });
+  if (picked === undefined || picked === null) return undefined;
+
+  const index = labels.indexOf(String(picked));
+  if (index === -1) return undefined;
+  if (question.allowOther !== false && index === question.options.length) {
+    const custom = await askCustom(ctx, question, signal);
+    return custom === undefined
+      ? undefined
+      : answerBase(question, [], [], custom);
+  }
+  const option = question.options[index];
+  if (!option) return undefined;
+  return answerBase(question, [option.label], [index]);
+}
+
+async function askMultiSelect(
+  ctx: ExtensionContext,
+  question: QuestionSpec,
+  signal?: AbortSignal,
+): Promise<QuestionAnswer | undefined> {
+  const remaining = question.options.map((option, index) => ({ option, index }));
+  const selected: string[] = [];
+  const selectedIndices: number[] = [];
+  let custom: string | undefined;
+
+  while (remaining.length > 0) {
+    const rows = remaining.map(({ option, index }) => {
+      const description = option.description?.trim();
+      return `${index + 1}. ${option.label}${description ? ` — ${description}` : ""}`;
+    });
+    const labels = [
+      ...rows,
+      ...(question.allowOther === false ? [] : [OTHER_LABEL]),
+      ...(selected.length > 0 || custom ? [DONE_LABEL] : []),
+    ];
+    const title = selected.length > 0 ? `${question.question} (selected: ${selected.join(", ")})` : question.question;
+
+    const picked = await ctx.ui.select(title, labels, { signal });
+    if (picked === undefined || picked === null) return undefined;
+    const choice = String(picked);
+    if (choice === DONE_LABEL) break;
+    if (question.allowOther !== false && choice === OTHER_LABEL) {
+      const typed = await askCustom(ctx, question, signal);
+      if (typed === undefined) return undefined;
+      custom = custom ? `${custom}; ${typed}` : typed;
       continue;
     }
-    const selected = stripDescription(value);
-    if (question.multiSelect) {
-      const more = await ctx.ui.confirm("Add another option?", `Already selected: ${selected}`);
-      const selectedAll = [selected];
-      if (more) {
-        const second = await ctx.ui.select("Additional option (or skip via Type something. then empty to stop)", labels);
-        if (second && String(second) !== OTHER) selectedAll.push(stripDescription(String(second)));
-      }
-      answers.push({ question: question.question, header: question.header, selected: selectedAll });
-    } else {
-      answers.push({ question: question.question, header: question.header, selected: [selected] });
-    }
+    const position = rows.indexOf(choice);
+    if (position === -1) return undefined;
+    selected.push(remaining[position].option.label);
+    selectedIndices.push(remaining[position].index);
+    remaining.splice(position, 1);
   }
-  return { answers, cancelled: false };
+
+  if (selected.length === 0 && !custom) return undefined;
+  return answerBase(question, selected, selectedIndices, custom);
 }
 
-async function askViaHostDialogs(ctx: ExtensionContext, questions: QuestionSpec[]) {
-  const answers: QuestionAnswer[] = [];
-  for (const question of questions) {
-    const labels = [...question.options.map((o) => displayOption(o)), OTHER];
-    const picked = await ctx.ui.select(question.question, labels);
-    if (picked === undefined || picked === null) return { answers, cancelled: true };
-    const value = String(picked);
-    if (value === OTHER) {
-      const custom = await ctx.ui.input("Your answer", "");
-      if (!custom?.trim()) return { answers, cancelled: true };
-      answers.push({ question: question.question, header: question.header, selected: [], custom: custom.trim() });
-    } else {
-      answers.push({ question: question.question, header: question.header, selected: [stripDescription(value)] });
-    }
-  }
-  return { answers, cancelled: false };
+function answerBase(
+  question: QuestionSpec,
+  selected: string[],
+  selectedIndices: number[],
+  custom?: string,
+): QuestionAnswer {
+  return {
+    id: question.id,
+    question: question.question,
+    header: question.header,
+    selected,
+    selectedIndices,
+    selectedValues: selectedIndices.map((index) => question.options[index]?.value ?? question.options[index]?.label ?? ""),
+    custom,
+  };
 }
 
-function displayOption(option: { label: string; description?: string }): string {
-  return option.description ? `${option.label} — ${option.description}` : option.label;
-}
-
-function stripDescription(value: string): string {
-  const idx = value.indexOf(" — ");
-  return idx === -1 ? value : value.slice(0, idx);
-}
-
-export function answersText(answers: QuestionAnswer[], cancelled: boolean): string {
-  return formatAnswers(answers, cancelled);
+async function askCustom(
+  ctx: ExtensionContext,
+  question: QuestionSpec,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const typed = await ctx.ui.input(question.header?.trim() || "Your answer", "", { signal });
+  const value = typed === undefined || typed === null ? "" : String(typed).trim();
+  return value.length > 0 ? value : undefined;
 }

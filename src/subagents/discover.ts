@@ -7,16 +7,23 @@ import { parseAgentMarkdown, type AgentDefinition, type AgentScope } from "./typ
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 function loadDir(dir: string, source: AgentDefinition["source"]): AgentDefinition[] {
-  if (!fs.existsSync(dir)) return [];
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
   const out: AgentDefinition[] = [];
-  for (const entry of fs.readdirSync(dir)) {
-    if (!entry.endsWith(".md")) continue;
+  for (const entry of entries.sort()) {
+    if (!entry.toLowerCase().endsWith(".md")) continue;
     const filePath = path.join(dir, entry);
     try {
+      if (!fs.statSync(filePath).isFile()) continue;
       const markdown = fs.readFileSync(filePath, "utf8");
-      out.push(parseAgentMarkdown(markdown, path.basename(entry, ".md"), source, filePath));
+      const agent = parseAgentMarkdown(markdown, path.basename(entry, path.extname(entry)), source, filePath);
+      if (agent.name) out.push(agent);
     } catch {
-      // skip unreadable agent files
+      // Skip unreadable or malformed agent files rather than failing discovery.
     }
   }
   return out;
@@ -40,5 +47,8 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDefinition[
 
 export function formatAgentList(agents: AgentDefinition[]): string {
   if (agents.length === 0) return "none";
-  return agents.map((a) => `${a.name} (${a.source}${a.description ? ` — ${a.description}` : ""})`).join("\n");
+  const width = Math.max(...agents.map((a) => a.name.length));
+  return agents
+    .map((a) => `${a.name.padEnd(width)}  [${a.source}] ${a.description || "(no description)"}`)
+    .join("\n");
 }

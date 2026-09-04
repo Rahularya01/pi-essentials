@@ -1,9 +1,15 @@
 {
-  "mcp": true,
+  "mcp": {
+    "enabled": true,
+    "requestTimeoutMs": 30000,
+    "idleTimeoutMs": 600000
+  },
   "web": {
     "enabled": true,
+    "allowedHosts": [],
     "search": {
       "provider": "auto",
+      "timeoutMs": 15000,
       "maxResults": 5
     },
     "fetch": {
@@ -16,6 +22,8 @@
   "subagents": {
     "enabled": true,
     "maxConcurrency": 4,
+    "maxParallel": 8,
+    "maxOutputBytes": 51200,
     "spawnBudget": 16,
     "allowNested": false
   },
