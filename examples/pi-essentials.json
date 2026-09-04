@@ -1,0 +1,24 @@
+{
+  "mcp": true,
+  "web": {
+    "enabled": true,
+    "search": {
+      "provider": "auto",
+      "maxResults": 5
+    },
+    "fetch": {
+      "timeoutMs": 15000,
+      "maxBytes": 2097152,
+      "maxChars": 32000,
+      "jinaFallback": true
+    }
+  },
+  "subagents": {
+    "enabled": true,
+    "maxConcurrency": 4,
+    "spawnBudget": 16,
+    "allowNested": false
+  },
+  "todos": true,
+  "questions": true
+}

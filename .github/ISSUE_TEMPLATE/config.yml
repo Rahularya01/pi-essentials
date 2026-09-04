@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Pi Coding Agent
+    url: https://github.com/earendil-works/pi
+    about: Issues with Pi itself, not this plugin
+  - name: Security report
+    url: https://github.com/Rahularya01/pi-essentials/security/advisories/new
+    about: Report a vulnerability privately
