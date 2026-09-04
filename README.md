@@ -1,5 +1,8 @@
 # pi-essentials
 
+[![CI](https://github.com/Rahularya01/pi-essentials/actions/workflows/ci.yml/badge.svg)](https://github.com/Rahularya01/pi-essentials/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A Pi Coding Agent package that combines MCP, web access, subagents, todos, and structured user questions in one plugin.
 
 Pi itself ships without these capabilities. `pi-essentials` registers them as a single extension with a shared config, shared limits, and independent modules. It does **not** wrap `pi-mcp-adapter`, `pi-web-access`, `pi-subagents`, or the juicesharp packages — it follows their proven patterns (proxy MCP tool, readability extraction, isolated child sessions, session-branch todos) with a smaller, security-first surface.
