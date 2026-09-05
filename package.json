@@ -19,6 +19,9 @@
     "type": "git",
     "url": "git+https://github.com/Rahularya01/pi-essentials.git"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts"
