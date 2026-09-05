@@ -68,7 +68,7 @@
     "@earendil-works/pi-tui": "*",
     "@types/node": "^24.3.0",
     "typebox": "*",
-    "typescript": "^5.9.2",
+    "typescript": "^7.0.2",
     "vitest": "^3.2.4"
   },
   "peerDependenciesMeta": {
