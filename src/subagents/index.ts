@@ -1,11 +1,13 @@
+import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { isKeyRelease, matchesKey, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { ResolvedConfig } from "../config.ts";
 import { toolFailure, toolText } from "../errors.ts";
 import { discoverAgents, formatAgentList } from "./discover.ts";
-import { fleetWidget, renderSubagentCall, renderSubagentResult } from "./render.ts";
+import { buildPaneCommand, openInspectorPane } from "./herdr.ts";
+import { FleetPanel, InspectorPanel, renderSubagentCall, renderSubagentResult } from "./render.ts";
 import { emptyUsage, mapLimit, runSubagent, type ActiveRun, type RunUsage, type SubagentRunResult } from "./runner.ts";
 import { effectiveOutputSchema, validateOutputSchema, type JsonSchema } from "./schema.ts";
 import { validateSubagentParams, type AgentDefinition, type AgentScope } from "./types.ts";
@@ -67,27 +69,59 @@ export function aggregateRunUsage(results: SubagentRunResult[]) {
 /** Spinner/elapsed refresh rate for the FleetView widget. */
 const WIDGET_TICK_MS = 120;
 
+/** Standalone, dependency-free viewer run inside a Herdr pane; see herdr.ts. */
+const INSPECTOR_TAIL_SCRIPT = fileURLToPath(new URL("./inspector-tail.mjs", import.meta.url));
+
 export function registerSubagents(pi: ExtensionAPI, config: ResolvedConfig): void {
   const active = new Map<string, ActiveRun>();
   let spawnedThisSession = 0;
   let ticker: NodeJS.Timeout | undefined;
   let lastCtx: ExtensionContext | undefined;
   let collapsed = false;
+  let roster = false;
+  let selectedId: string | undefined;
+  let mounted = false;
+  let inspectOpen = false;
+  let tuiRef: TUI | undefined;
+  let inputUnsub: (() => void) | undefined;
+  const panel = new FleetPanel();
 
   const renderFleet = (ctx: ExtensionContext) => {
     lastCtx = ctx;
     if (!ctx.hasUI) return;
-    if (active.size === 0) {
+    if (selectedId && !active.has(selectedId)) selectedId = undefined;
+    if (active.size === 0 || inspectOpen) {
+      if (active.size === 0) {
+        selectedId = undefined;
+        roster = false;
+      }
+      mounted = false;
       ctx.ui.setWidget("pi-essentials-subagents", undefined);
       return;
     }
+    if (!selectedId) selectedId = [...active.keys()][0];
     const runs = [...active.values()];
-    const options = { collapsed, spawned: spawnedThisSession, budget: config.subagents.spawnBudget };
-    ctx.ui.setWidget(
-      "pi-essentials-subagents",
-      (_tui, theme) => new Text(fleetWidget(theme, runs, options).join("\n"), 0, 0),
-      { placement: "belowEditor" },
-    );
+    panel.setState(runs, {
+      collapsed,
+      spawned: spawnedThisSession,
+      budget: config.subagents.spawnBudget,
+      selectedId,
+      roster,
+    });
+    if (!mounted) {
+      mounted = true;
+      ctx.ui.setWidget(
+        "pi-essentials-subagents",
+        (tui, theme) => {
+          tuiRef = tui;
+          panel.setTheme(theme);
+          return panel;
+        },
+        { placement: "belowEditor" },
+      );
+    } else {
+      tuiRef?.requestRender();
+    }
   };
 
   // Elapsed times would otherwise only advance when a child emits progress.
@@ -116,11 +150,22 @@ export function registerSubagents(pi: ExtensionAPI, config: ResolvedConfig): voi
     spawnedThisSession = 0;
     stopAll();
     lastCtx = ctx;
+    inputUnsub?.();
+    if (ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
+      inputUnsub = ctx.ui.onTerminalInput((data) => handleFleetKeys(ctx, data));
+    }
     renderFleet(ctx);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     stopAll();
+    selectedId = undefined;
+    roster = false;
+    inspectOpen = false;
+    mounted = false;
+    inputUnsub?.();
+    inputUnsub = undefined;
+    if (ctx.hasUI) ctx.ui.setWidget("pi-essentials-subagents", undefined);
   });
 
   pi.registerShortcut("ctrl+shift+a", {
@@ -131,10 +176,171 @@ export function registerSubagents(pi: ExtensionAPI, config: ResolvedConfig): voi
     },
   });
 
+  const resolveRun = (token: string | undefined): ActiveRun | undefined => {
+    if (!token) return undefined;
+    return active.get(token) ?? [...active.values()].find((run) => run.agent === token);
+  };
+
+  /**
+   * Open a running child in a real, separate Herdr pane (read-only) instead of the
+   * in-app overlay. Best-effort: Herdr is an optional third-party tool the user
+   * installs themselves, so any failure just falls back to notifying, not throwing.
+   */
+  const openHerdrInspector = async (ctx: ExtensionContext, run: ActiveRun | undefined): Promise<void> => {
+    if (!config.subagents.herdr) {
+      ctx.ui.notify("Herdr inspector is disabled (subagents.herdr = false).", "warning");
+      return;
+    }
+    if (!run) {
+      ctx.ui.notify("Pick a running subagent to open in Herdr.", "warning");
+      return;
+    }
+    if (!run.logFile) {
+      ctx.ui.notify(`No live log available yet for ${run.agent}.`, "warning");
+      return;
+    }
+    const command = buildPaneCommand(process.execPath, [INSPECTOR_TAIL_SCRIPT, "--log", run.logFile]);
+    const opened = await openInspectorPane({ cwd: ctx.cwd, command });
+    ctx.ui.notify(
+      opened.ok ? `Opened ${run.agent} in a new Herdr pane (read-only).` : (opened.message ?? "Could not open a Herdr pane."),
+      opened.ok ? "info" : "warning",
+    );
+  };
+
+  const watchRun = async (ctx: ExtensionContext, token?: string): Promise<void> => {
+    if (active.size === 0) {
+      ctx.ui.notify("No running subagents.", "warning");
+      return;
+    }
+    let run = resolveRun(token);
+    if (!run && selectedId) run = active.get(selectedId);
+    if (!run && active.size === 1) run = [...active.values()][0];
+    if (!run && ctx.hasUI) {
+      const choice = await ctx.ui.select(
+        "Watch subagent",
+        [...active.values()].map((item) => `${item.id}  ${item.agent}  ${truncate(item.activity || item.task, 48)}`),
+      );
+      run = resolveRun(choice?.split(/\s+/)[0]);
+    }
+    if (!run) {
+      ctx.ui.notify(token ? `No running subagent "${token}".` : "Pick a running subagent to watch.", "warning");
+      return;
+    }
+    selectedId = run.id;
+    if (!ctx.hasUI) {
+      renderFleet(ctx);
+      return;
+    }
+    if (inspectOpen) {
+      renderFleet(ctx);
+      tuiRef?.requestRender();
+      return;
+    }
+    inspectOpen = true;
+    renderFleet(ctx);
+    await ctx.ui.custom<undefined>(
+      (tui, theme, _kb, done) => {
+        tuiRef = tui;
+        return new InspectorPanel(
+          () => [...active.values()],
+          () => selectedId,
+          (id) => {
+            selectedId = id;
+            renderFleet(ctx);
+          },
+          theme,
+          () => {
+            inspectOpen = false;
+            selectedId = undefined;
+            done(undefined);
+            renderFleet(ctx);
+          },
+          tui,
+          (selected) => void openHerdrInspector(ctx, selected),
+        );
+      },
+      {
+        overlay: true,
+        overlayOptions: { anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 },
+      },
+    );
+    inspectOpen = false;
+    roster = false;
+    renderFleet(ctx);
+  };
+
+  function handleFleetKeys(ctx: ExtensionContext, data: string): { consume?: boolean } | undefined {
+    if (inspectOpen || collapsed || active.size === 0 || isKeyRelease(data) || !ctx.hasUI) return undefined;
+    const editorEmpty = (ctx.ui.getEditorText?.() ?? "") === "";
+    if (!roster) {
+      if (editorEmpty && (matchesKey(data, "down") || matchesKey(data, "left"))) {
+        roster = true;
+        selectedId ??= [...active.keys()][0];
+        renderFleet(ctx);
+        return { consume: true };
+      }
+      return undefined;
+    }
+    if (!editorEmpty) {
+      roster = false;
+      renderFleet(ctx);
+      return undefined;
+    }
+    const ids = [...active.keys()];
+    const index = Math.max(0, ids.indexOf(selectedId ?? ""));
+    if (matchesKey(data, "down") || matchesKey(data, "j")) {
+      selectedId = ids[Math.min(ids.length - 1, index + 1)];
+      renderFleet(ctx);
+      return { consume: true };
+    }
+    if (matchesKey(data, "up") || matchesKey(data, "k")) {
+      if (index <= 0) {
+        roster = false;
+        renderFleet(ctx);
+        return { consume: true };
+      }
+      selectedId = ids[index - 1];
+      renderFleet(ctx);
+      return { consume: true };
+    }
+    if (matchesKey(data, "escape")) {
+      roster = false;
+      renderFleet(ctx);
+      return { consume: true };
+    }
+    if (matchesKey(data, "return")) {
+      void watchRun(ctx, selectedId);
+      return { consume: true };
+    }
+    if (matchesKey(data, "h")) {
+      void openHerdrInspector(ctx, resolveRun(selectedId));
+      return { consume: true };
+    }
+    roster = false;
+    renderFleet(ctx);
+    return undefined;
+  }
+
+  panel.onSelect = (id) => {
+    selectedId = id;
+    if (lastCtx) {
+      renderFleet(lastCtx);
+      if (!inspectOpen) void watchRun(lastCtx, id);
+    }
+  };
+
   pi.registerCommand("subagents", {
-    description: "List agents and running subagent jobs. Usage: /subagents [cancel <id>|cancel all]",
+    description: "List agents and running subagent jobs. Usage: /subagents [watch <id>|pane <id>|cancel <id>|cancel all]",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
+      if (parts[0] === "watch") {
+        await watchRun(ctx, parts[1]);
+        return;
+      }
+      if (parts[0] === "pane") {
+        await openHerdrInspector(ctx, resolveRun(parts[1]) ?? (selectedId ? active.get(selectedId) : undefined) ?? (active.size === 1 ? [...active.values()][0] : undefined));
+        return;
+      }
       if (parts[0] === "cancel") {
         const target = parts[1];
         if (!target) {
@@ -148,17 +354,21 @@ export function registerSubagents(pi: ExtensionAPI, config: ResolvedConfig): voi
           ctx.ui.notify(count > 0 ? `Cancelled ${count} subagent(s)` : "No running subagents.", "info");
           return;
         }
-        const run = active.get(target);
+        const run = resolveRun(target);
         if (!run?.proc) {
           ctx.ui.notify(`No running subagent "${target}".`, "warning");
           return;
         }
         run.proc.kill("SIGTERM");
-        ctx.ui.notify(`Cancelled ${target}`, "info");
+        ctx.ui.notify(`Cancelled ${run.id}`, "info");
         return;
       }
       if (parts.length > 0) {
-        ctx.ui.notify("Usage: /subagents [cancel <id|all>]", "warning");
+        ctx.ui.notify("Usage: /subagents [watch <id>|pane <id>|cancel <id|all>]", "warning");
+        return;
+      }
+      if (active.size > 0 && ctx.hasUI) {
+        await watchRun(ctx);
         return;
       }
       const agents = discoverAgents(ctx.cwd, "both");
@@ -166,7 +376,7 @@ export function registerSubagents(pi: ExtensionAPI, config: ResolvedConfig): voi
         active.size === 0
           ? "No running subagents."
           : [...active.values()]
-              .map((r) => `${r.id}  ${r.agent}  ${Math.round((Date.now() - r.startedAt) / 1000)}s — ${truncate(r.task, 60)}`)
+              .map((r) => `${r.id}  ${r.agent}  ${Math.round((Date.now() - r.startedAt) / 1000)}s — ${truncate(r.activity || r.task, 60)}`)
               .join("\n");
       const budget = `Spawned ${spawnedThisSession}/${config.subagents.spawnBudget} this session.`;
       ctx.ui.notify(`${running}\n${budget}\n\nAgents:\n${formatAgentList(agents)}`, "info");
@@ -319,7 +529,21 @@ export function registerSubagents(pi: ExtensionAPI, config: ResolvedConfig): voi
             signal,
             outputSchema: jobSchemas[jobIndex],
             onProgress: (partial) => {
-              onUpdate?.(toolText(`${agent.name}: ${truncate(partial, 800)}`));
+              const live = [...active.values()].map((item) => ({
+                id: item.id,
+                agent: item.agent,
+                task: item.task,
+                activity: item.activity,
+                events: item.events,
+                running: true,
+                exitCode: 0,
+              }));
+              onUpdate?.(
+                toolText(
+                  live.map((item) => `${item.agent}: ${truncate(item.activity || partial, 200)}`).join("\n") || partial,
+                  { mode: validated.mode, results: live },
+                ),
+              );
             },
             register: (run) => {
               active.set(run.id, run);

@@ -3,7 +3,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { ActivityLog, activityWidget } from "../src/web/activity.ts";
 import { mcpStatusText, renderMcpCall, renderMcpResult } from "../src/mcp/render.ts";
 import { renderAskCall, renderAskResult } from "../src/questions/render.ts";
-import { fleetWidget, renderSubagentCall, renderSubagentResult } from "../src/subagents/render.ts";
+import { conversationLines, fleetLayout, fleetWidget, hitTestFleet, inspectorFrame, rosterLines, renderSubagentCall, renderSubagentResult, renderTraceEvent } from "../src/subagents/render.ts";
 import { formatTodosGrouped, renderTodoCall, renderTodoResult, todoWidget } from "../src/todos/render.ts";
 import { renderFetchCall, renderFetchResult, renderSearchCall, renderSearchResult } from "../src/web/render.ts";
 import { formatCost, formatDuration, oneLine, plural, progressBar, shortUrl } from "../src/ui/render.ts";
@@ -86,7 +86,8 @@ describe("web rendering", () => {
     const out = view(
       renderSearchResult({ content: [], details: { provider: "brave", hits } }, { expanded: false, isPartial: false }, theme, slot()),
     );
-    expect(out).toContain("✓ 5 results · brave");
+    expect(out).toContain("✓ 5 results");
+    expect(out).not.toContain("brave");
     expect(out).toContain("1. Result 1");
     expect(out).toContain("+2 more results · ctrl+o to expand");
     expect(out).not.toContain("Result 5");
@@ -125,8 +126,8 @@ describe("web rendering", () => {
   });
 
   it("renders call headers and error states", () => {
-    expect(view(renderSearchCall({ query: "streams", provider: "brave" }, theme, slot()))).toBe(
-      'web_search "streams" · brave',
+    expect(view(renderSearchCall({ query: "streams", numResults: 5 }, theme, slot()))).toBe(
+      'web_search "streams" · 5 results',
     );
     expect(view(renderFetchCall({ url: "https://x.test/a/b" }, theme, slot()))).toBe("web_fetch x.test/a/b");
     expect(view(renderFetchCall({ cacheId: "abc" }, theme, slot()))).toBe("web_fetch cache abc");
@@ -137,7 +138,7 @@ describe("web rendering", () => {
 
   it("logs activity rows with outcome and timing", async () => {
     const log = new ActivityLog();
-    await log.track("search", "streams", async () => ({ provider: "brave", hits: [1, 2] }), (r) => `${r.provider} · ${r.hits.length} hits`);
+    await log.track("search", "streams", async () => ({ hits: [1, 2] }), (r) => `${r.hits.length} hits`);
     await expect(
       log.track("fetch", "https://x.test/gone", async () => { throw new Error("HTTP 404 fetching"); }, () => ""),
     ).rejects.toThrow();
@@ -247,17 +248,98 @@ describe("subagent rendering", () => {
   it("shows a live spinner row per running child", () => {
     const now = 1_000_000;
     const runs = [
-      { id: "a", agent: "scout", task: "Map the payment flow", startedAt: now - 18_400 },
-      { id: "b", agent: "reviewer", task: "Review tests", startedAt: now - 4200 },
+      { id: "a", agent: "scout", task: "Map the payment flow", startedAt: now - 18_400, activity: "", events: [] },
+      { id: "b", agent: "reviewer", task: "Review tests", startedAt: now - 4200, activity: "read src/auth.ts", events: [{ kind: "tool", name: "read", args: "src/auth.ts", status: "running" }] },
     ] as never;
     const lines = fleetWidget(theme, runs, { collapsed: false, spawned: 5, budget: 16, now });
-    expect(lines[0]).toContain("Subagents");
-    expect(lines[0]).toContain("5/16 spawned");
-    expect(lines[1]).toContain("scout 18.4s · Map the payment flow");
-    expect(lines).toHaveLength(3);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("2 running agents");
+    expect(lines[0]).toContain("↓/← to inspect");
+
+    const roster = fleetWidget(theme, runs, { collapsed: false, spawned: 5, budget: 16, now, roster: true, selectedId: "b" });
+    expect(roster[0]).toContain("enter inspect");
+    expect(roster.join("\n")).toContain("reviewer");
 
     expect(fleetWidget(theme, runs, { collapsed: true, spawned: 5, budget: 16, now })).toHaveLength(1);
     expect(fleetWidget(theme, [], { collapsed: false, spawned: 0, budget: 16, now })).toEqual([]);
+  });
+
+  it("maps a fleet click to that child and renders its live transcript", () => {
+    const now = 1_000_000;
+    const runs = [
+      {
+        id: "a",
+        agent: "scout",
+        task: "Map the payment flow",
+        startedAt: now - 18_400,
+        activity: "bash · git log",
+        events: [
+          { kind: "tool", name: "bash", args: "git log --oneline", status: "ok" },
+          { kind: "text", text: "abc123 Wire the panel" },
+        ],
+      },
+      { id: "b", agent: "reviewer", task: "Review tests", startedAt: now - 4200, activity: "", events: [] },
+    ] as never;
+    const layout = fleetLayout(theme, runs, { collapsed: false, spawned: 5, budget: 16, now, roster: true, selectedId: "a" });
+    expect(layout.lines.join("\n")).toContain("scout");
+    expect(hitTestFleet(layout.hits, layout.hits[0].y0)).toBe("a");
+    expect(hitTestFleet(layout.hits, layout.hits[1].y0)).toBe("b");
+    const inspect = conversationLines(theme, runs[0], now).join("\n");
+    expect(inspect).toContain("Conversation");
+    expect(inspect).toContain("git log --oneline");
+    expect(inspect).toContain("abc123 Wire the panel");
+    expect(renderTraceEvent(theme, { kind: "tool", name: "read", args: "src/auth.ts", status: "running" })).toContain("running");
+  });
+
+  it("marks the selected child in the roster column", () => {
+    const now = 1_000_000;
+    const runs = [
+      { id: "a", agent: "scout", task: "Map the payment flow", startedAt: now - 18_400, activity: "", events: [] },
+      { id: "b", agent: "reviewer", task: "Review tests", startedAt: now - 4200, activity: "", events: [] },
+    ] as never;
+    const rows = rosterLines(theme, runs, "b", now);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).not.toContain(">");
+    expect(rows[1]).toContain(">");
+    expect(rows[1]).toContain("reviewer");
+    expect(rows[1]).toContain("b");
+  });
+
+  it("renders the inspector as a bordered two-column frame -- roster beside the live transcript", () => {
+    const now = 1_000_000;
+    const runs = [
+      {
+        id: "a",
+        agent: "scout",
+        task: "Map the payment flow",
+        startedAt: now - 18_400,
+        activity: "",
+        events: [{ kind: "tool", name: "bash", args: "git log --oneline", status: "ok" }],
+      },
+      { id: "b", agent: "reviewer", task: "Review tests", startedAt: now - 4200, activity: "", events: [] },
+    ] as never;
+    const { lines, maxScroll } = inspectorFrame(theme, runs, "a", { width: 80, rows: 6, scroll: 0, now });
+    expect(lines[0]).toContain("Subagent fleet inspector");
+    expect(lines[0]).toContain("scout");
+    expect(lines.at(-1)).toMatch(/^└─+┴─+┘$/);
+    // Every framed row (border rows and content rows alike) must be exactly the requested width.
+    for (const line of lines) expect(line.length).toBe(80);
+    const body = lines.join("\n");
+    expect(body).toContain("reviewer"); // roster column
+    expect(body).toContain("git log --oneline"); // conversation column
+    expect(maxScroll).toBe(0);
+  });
+
+  it("clamps inspector scroll to the conversation length and paginates long transcripts", () => {
+    const now = 1_000_000;
+    const events = Array.from({ length: 20 }, (_, i) => ({ kind: "text", text: `line ${i}` }));
+    const runs = [{ id: "a", agent: "scout", task: "Long task", startedAt: now, activity: "", events }] as never;
+    const { lines: page1, maxScroll } = inspectorFrame(theme, runs, "a", { width: 80, rows: 5, scroll: 0, now });
+    expect(maxScroll).toBeGreaterThan(0);
+    expect(page1.join("\n")).toContain("line 0");
+    expect(page1.join("\n")).not.toContain("line 19");
+    const { lines: pageOver } = inspectorFrame(theme, runs, "a", { width: 80, rows: 5, scroll: 999, now });
+    expect(pageOver.join("\n")).toContain(`line ${20 - 5}`);
   });
 });
 

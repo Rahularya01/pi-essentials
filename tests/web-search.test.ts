@@ -19,6 +19,7 @@ describe("web search compatibility", () => {
     expect(schema?.properties?.numResults?.type).toBe("integer");
     expect(schema?.properties?.limit?.type).toBe("integer");
     expect(schema?.properties?.num_search_results?.type).toBe("integer");
+    expect(schema?.properties?.provider).toBeUndefined();
   });
 
   it("accepts count aliases with documented precedence", () => {
@@ -57,6 +58,8 @@ describe("web search compatibility", () => {
       query: "q",
       hits: [{ title: "A", url: "https://example.com/", snippet: "x".repeat(500), source: "test" }],
     });
+    expect(output.startsWith('Search for "q":')).toBe(true);
+    expect(output).not.toContain("(test)");
     const snippet = output.split("\n").find((line) => line.trimStart().startsWith("x"));
     expect(snippet?.trim().length).toBe(240);
     expect(snippet).toMatch(/…$/);

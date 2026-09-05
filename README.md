@@ -82,6 +82,7 @@ produce a startup warning instead of being silently dropped.
 | `subagents.maxOutputBytes` | `51200` | UTF-8 byte cap on each child's returned answer |
 | `subagents.spawnBudget` | `16` | Children per session |
 | `subagents.allowNested` | `false` | Let a child spawn its own children |
+| `subagents.herdr` | `true` | Allow opening a running child in an external Herdr pane |
 
 API keys may also come from `BRAVE_API_KEY`, `TAVILY_API_KEY`, `EXA_API_KEY`, `JINA_API_KEY`, and `SEARXNG_URL`.
 
@@ -93,8 +94,8 @@ Every tool renders one compact row: what it did, then dimmed metadata. Detail is
 available on demand with `ctrl+o` rather than printed by default.
 
 ```
-web_search "typescript readable streams" · brave
-✓ 4 results · brave
+web_search "typescript readable streams"
+✓ 4 results
   1. Stream | Node.js v26 Documentation
      nodejs.org/api/stream.html
   2. Backpressure in Streams
@@ -125,14 +126,12 @@ Three panels sit around the editor and each collapses to a single line:
   ✓ #1 R̶e̶a̶d̶ ̶t̶h̶e̶ ̶d̶o̶c̶s̶
   +1 more (1 completed)
 
-── Subagents ───────────────── 2 running · 5/16 spawned
-  ⠹ scout    18.4s · Map the payment flow end to end
-  ⠼ reviewer  4.2s · Review the new tests
+  2 running agents · 5/16 spawned · ↓/← to inspect
 
 ── Web activity ───────────────────────────── 3 recent
   FETCH  blog.example.com/gone      HTTP 404       260ms ✗
   FETCH  nodejs.org/api/stream.html 194.8k chars   812ms ✓
-  SEARCH "typescript streams"       brave · 5 hits  2.1s ✓
+  SEARCH "typescript streams"       5 hits  2.1s ✓
 ```
 
 Panels appear only when they have something to say, and an overflow line names
@@ -158,6 +157,10 @@ mcp({ action: "describe", tool: "chrome_devtools_take_screenshot" })
 mcp({ action: "call", tool: "chrome_devtools_take_screenshot", args: { format: "png" } })
 mcp({ action: "status" })
 mcp({ action: "auth", server: "linear" })
+mcp({ action: "auth-start", server: "linear" })
+mcp({ action: "auth-complete", server: "linear", redirectUrl: "http://127.0.0.1:5173/callback?code=...&state=..." })
+mcp({ action: "auth-complete", server: "linear", code: "..." })
+mcp({ action: "logout", server: "linear" })
 ```
 
 Servers can share defaults through a `settings` block in the same file:
@@ -166,7 +169,7 @@ Servers can share defaults through a `settings` block in the same file:
 { "settings": { "requestTimeoutMs": 30000, "idleTimeout": 10 }, "mcpServers": { } }
 ```
 
-Commands: `/mcp` (status table), `/mcp tools`, `/mcp reconnect [name]`, `/mcp auth <name>`, `/mcp disconnect [name]`. A footer entry tracks connection health while the session runs.
+Commands: `/mcp` (status table), `/mcp tools`, `/mcp reconnect [name]`, `/mcp auth <name> [redirectUrl]`, `/mcp auth-start <name>`, `/mcp auth-complete <name> <redirectUrl>`, `/mcp logout <name>`, `/mcp disconnect [name]`. A footer entry tracks connection health while the session runs.
 
 Tool discovery connects lazily and in parallel, and leaves healthy connections
 alone. Calls include MCP `structuredContent` as formatted JSON, without repeating
@@ -176,7 +179,20 @@ server results marked `isError` are surfaced as real tool errors. Binary results
 (screenshots, audio, blobs) are summarized rather than pasted into the parent
 context as base64.
 
-OAuth uses PKCE and a local loopback callback. Tokens are stored at `~/.pi/agent/pi-essentials/mcp-oauth.json` (mode `0600`) keyed by `{serverName, url}`. Bearer tokens and header env interpolation (`${VAR}`, `$env:VAR`) are supported. Command-substitution secrets (`!cmd`) are not.
+OAuth uses PKCE and a local loopback callback. `auth` runs the whole flow in one
+blocking call (up to 5 minutes waiting for the browser). `auth-start` returns the
+authorization URL immediately and finishes in the background if the callback
+arrives; otherwise finish explicitly with `auth-complete` and either the full
+pasted `redirectUrl` (works even from a different call or session, since the PKCE
+verifier is read back from storage) or a bare `code` (only within the same
+process, since that needs the exact redirect URI `auth-start` advertised).
+`logout` clears stored credentials for a server. Tokens prefer the OS credential
+store (macOS Keychain, Windows Credential Manager, Linux Secret Service) and fall
+back to a local file (`~/.pi/agent/pi-essentials/mcp-oauth.json`, mode `0600`)
+when none is available, importing any existing plaintext entry into the
+credential store the first time it becomes available. Bearer tokens and header
+env interpolation (`${VAR}`, `$env:VAR`) are supported. Command-substitution
+secrets (`!cmd`) are not.
 
 Example server file: [`examples/mcp.json`](examples/mcp.json).
 
@@ -195,8 +211,8 @@ result-count spellings (1-20). If more than one is supplied, precedence is
 is used. The fallback chain (skipping unconfigured providers) is SearXNG → Brave
 → Tavily → Exa → Jina → DuckDuckGo.
 
-`/web` shows what the web tools actually did this session (provider, size, timing,
-outcome) and `/web clear` empties it.
+`/web` shows what the web tools actually did this session (size, timing,
+outcome) and `/web clear` empties it. The backend name is not shown in the TUI.
 
 `web_fetch` requires exactly one of `url` or `cacheId`; supplying both or neither
 is an error. It extracts readable markdown (Readability), truncates large pages, and
@@ -278,7 +294,17 @@ changes. The source checkout is never modified automatically. After the run, the
 temporary worktree is removed and result details report changed files plus a
 binary-capable patch artifact path; the patch is **not** auto-applied.
 
-`/subagents` lists agents and running jobs; `/subagents cancel <id|all>` stops them. A FleetView panel below the editor tracks each running child with a live spinner and elapsed time.
+With the editor empty, press `↓` or `←` to expand the fleet roster, then `Enter` (or click a row) to open a near-fullscreen live inspector — the same flow as pi-subagents. The inspector is a bordered, two-column frame: a roster on the left and the selected child's live task/tool/text transcript on the right, matching pi-subagents' Fleet inspector layout rather than a single stacked list. `j`/`k` switches children, `pgup`/`pgdn` scrolls the transcript, Esc closes. `/subagents` opens that inspector while work is running. Ctrl+O on the running tool card expands the live tool stream. No steering or session takeover.
+
+Press `h` in the roster or the inspector (or run `/subagents pane [id]`) to open the
+selected child in a real, separate [Herdr](https://github.com/herdrdev/herdr) pane
+instead of the in-app overlay — the same "new window" experience pi-subagents offers
+through its own Herdr integration. This is entirely optional and best-effort: if
+`herdr` isn't on PATH (or `subagents.herdr` is set to `false`), pi-essentials just
+notifies you and keeps using the in-app inspector. The pane is read-only (no steer,
+no stop) and runs a small standalone script that tails the child's own event log; it
+never receives model- or task-controlled text as a shell argument, only paths this
+package generates itself.
 
 ## Todos
 

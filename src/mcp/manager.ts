@@ -9,7 +9,7 @@ import { capText, errorMessage, isAbortError, PiEssentialsError } from "../error
 import { interpolateEnvValue, interpolateRecord, timeoutSignal } from "../security/env.ts";
 import { CONNECT_TIMEOUT_MS, MAX_TOOL_RESULT_CHARS } from "../security/limits.ts";
 import { loadMcpServers, serverTransport } from "./config.ts";
-import { FileOAuthProvider, maybeOpenUrl, startLoopbackCallback } from "./oauth.ts";
+import { FileOAuthProvider, maybeOpenUrl, startLoopbackCallback, type LoopbackCallback } from "./oauth.ts";
 import type { CachedTool, McpFileShape, ResolvedServer, ServerSnapshot, ServerStatus } from "./types.ts";
 
 interface LiveConnection {
@@ -171,12 +171,22 @@ function resolveTool(tools: CachedTool[], name: string): CachedTool | undefined 
 
 export const __testing = { stringifyToolResult, mcpResultError, resolveTool, httpStatus };
 
+interface PendingAuth {
+  loopback: LoopbackCallback;
+  timeout: NodeJS.Timeout;
+  /** The exact redirect URI this attempt advertised, needed to complete with a bare `code`. */
+  redirectUri: string;
+}
+
 export class McpManager {
   private readonly states = new Map<string, ServerState>();
   private closed = false;
   /** Config problems surfaced through the UI at session start, not the console. */
   readonly warnings: string[] = [];
   private readonly fileSettings: McpFileShape["settings"];
+  /** One in-flight browser-based auth attempt per server; see authStart/authComplete. */
+  private readonly pendingAuth = new Map<string, PendingAuth>();
+  private readonly authListeners = new Set<(server: string, message: string) => void>();
 
   constructor(
     private readonly cwd: string,
@@ -291,7 +301,22 @@ export class McpManager {
 
   async shutdown(): Promise<void> {
     this.closed = true;
+    for (const name of [...this.pendingAuth.keys()]) this.cancelPendingAuth(name);
     await this.disconnect();
+  }
+
+  /** Notified when a background browser-based auth (started by authStart) finishes without a follow-up call. */
+  onAuthUpdate(listener: (server: string, message: string) => void): () => void {
+    this.authListeners.add(listener);
+    return () => this.authListeners.delete(listener);
+  }
+
+  private cancelPendingAuth(name: string): void {
+    const pending = this.pendingAuth.get(name);
+    if (!pending) return;
+    this.pendingAuth.delete(name);
+    clearTimeout(pending.timeout);
+    pending.loopback.close();
   }
 
   /** Force a reconnect of every enabled server (used by /mcp reconnect). */
@@ -387,6 +412,8 @@ export class McpManager {
       await this.connectWithProvider(state, provider, signal, true);
       const authorize = provider.takeRedirectUrl();
       if (!authorize && state.live) {
+        await this.markConnected(state, signal);
+        state.discovered = false;
         return `Connected to "${name}" (existing credentials worked).`;
       }
       if (!authorize) {
@@ -402,6 +429,136 @@ export class McpManager {
     } finally {
       loopback.close();
     }
+  }
+
+  /**
+   * Non-blocking counterpart to `auth()`: returns the authorization URL right
+   * away instead of waiting up to 5 minutes for the browser callback. A
+   * background listener still completes the flow automatically if the
+   * callback does arrive; otherwise call `authComplete` with the pasted
+   * redirect URL (works from a different call, session, or even process,
+   * since the PKCE verifier is read back from the credential store) or the
+   * bare `code` (only within this same process, since that needs the exact
+   * redirect URI this attempt advertised).
+   */
+  async authStart(name: string, signal?: AbortSignal): Promise<{ authorizeUrl?: string; message: string }> {
+    const state = this.requireServer(name);
+    if (!state.server.definition.url) {
+      throw new PiEssentialsError(`Server "${name}" is stdio and does not use OAuth.`, "MCP_NO_OAUTH");
+    }
+    await this.disconnectState(state);
+    this.cancelPendingAuth(name);
+
+    const loopback = await startLoopbackCallback();
+    const provider = this.createOAuthProvider(state, loopback.redirectUri);
+    let authorize: URL | undefined;
+    try {
+      await this.connectWithProvider(state, provider, signal, true);
+      authorize = provider.takeRedirectUrl();
+    } catch (error) {
+      loopback.close();
+      throw error;
+    }
+
+    if (!authorize && state.live) {
+      loopback.close();
+      await this.markConnected(state, signal);
+      state.discovered = false;
+      return { message: `Connected to "${name}" (existing credentials worked).` };
+    }
+    if (!authorize) {
+      loopback.close();
+      throw new PiEssentialsError(`OAuth did not produce an authorization URL for "${name}".`, "MCP_OAUTH_FAILED");
+    }
+
+    const opened = await maybeOpenUrl(authorize.toString());
+    const timeout = setTimeout(() => this.cancelPendingAuth(name), 5 * 60_000);
+    timeout.unref?.();
+    this.pendingAuth.set(name, { loopback, timeout, redirectUri: loopback.redirectUri });
+
+    loopback
+      .waitForCallback(5 * 60_000)
+      .then(async (callback) => {
+        // Superseded by a cancel, a manual authComplete, or a fresh authStart for the same server.
+        if (this.pendingAuth.get(name)?.loopback !== loopback) return;
+        this.pendingAuth.delete(name);
+        clearTimeout(timeout);
+        try {
+          await this.finishAuthOnProvider(state, provider, callback, signal);
+          state.discovered = false;
+          this.notifyAuth(name, `Authenticated with "${name}".`);
+        } catch (error) {
+          this.notifyAuth(name, `OAuth for "${name}" failed: ${errorMessage(error)}`);
+        } finally {
+          loopback.close();
+        }
+      })
+      .catch(() => {
+        if (this.pendingAuth.get(name)?.loopback === loopback) this.cancelPendingAuth(name);
+        else loopback.close();
+      });
+
+    const authorizeUrl = authorize.toString();
+    return {
+      authorizeUrl,
+      message: opened
+        ? `Opened a browser to authenticate "${name}". Waiting for the callback in the background; ` +
+          `if it does not complete, call authComplete with the redirect URL.`
+        : `Open this URL to authenticate "${name}": ${authorizeUrl}\n` +
+          `Waiting for the callback in the background; if it does not complete, call authComplete with the redirect URL.`,
+    };
+  }
+
+  /** Finish an auth-start flow with a pasted redirect URL, or (same-process only) a bare code. */
+  async authComplete(name: string, input: { redirectUrl?: string; code?: string }, signal?: AbortSignal): Promise<string> {
+    const state = this.requireServer(name);
+    if (!state.server.definition.url) {
+      throw new PiEssentialsError(`Server "${name}" is stdio and does not use OAuth.`, "MCP_NO_OAUTH");
+    }
+    const pending = this.pendingAuth.get(name);
+    this.cancelPendingAuth(name);
+
+    if (input.redirectUrl) {
+      await this.disconnectState(state);
+      return this.finishExistingAuth(state, input.redirectUrl, signal);
+    }
+    if (input.code) {
+      const redirectUri = pending?.redirectUri ?? state.server.definition.oauth?.redirectUri;
+      if (!redirectUri) {
+        throw new PiEssentialsError(
+          `No pending authStart redirect URI for "${name}" and none is configured; pass the full redirectUrl instead.`,
+          "MCP_OAUTH_FAILED",
+        );
+      }
+      await this.disconnectState(state);
+      const provider = this.createOAuthProvider(state, redirectUri);
+      const callback = new URL(redirectUri);
+      callback.searchParams.set("code", input.code);
+      await this.finishAuthOnProvider(state, provider, callback, signal);
+      state.discovered = false;
+      return `Authenticated with "${name}".`;
+    }
+    throw new PiEssentialsError("authComplete requires redirectUrl or code.", "MCP_BAD_ARGS");
+  }
+
+  /** Clear stored OAuth credentials for a server and disconnect it. */
+  async logout(name: string): Promise<string> {
+    const state = this.requireServer(name);
+    if (!state.server.definition.url) {
+      throw new PiEssentialsError(`Server "${name}" is stdio and does not use OAuth.`, "MCP_NO_OAUTH");
+    }
+    this.cancelPendingAuth(name);
+    await this.disconnectState(state);
+    const provider = this.createOAuthProvider(state);
+    await provider.clearTokens();
+    if (state.status !== "disabled") state.status = "idle";
+    state.tools = [];
+    state.discovered = false;
+    return `Cleared stored OAuth credentials for "${name}".`;
+  }
+
+  private notifyAuth(server: string, message: string): void {
+    for (const listener of this.authListeners) listener(server, message);
   }
 
   formatStatus(): string {
@@ -429,7 +586,11 @@ export class McpManager {
     const url = new URL(redirectUrl);
     const redirectUri = `${url.protocol}//${url.host}${url.pathname}`;
     const provider = this.createOAuthProvider(state, redirectUri);
-    await this.connectWithProvider(state, provider, signal, true);
+    // Do not run connectWithProvider here: it would trigger a fresh OAuth
+    // discovery/registration attempt and mint a new PKCE code_verifier, silently
+    // invalidating the one the authorization code in `redirectUrl` was issued
+    // against. finishAuthOnProvider reads the verifier persisted by the earlier
+    // auth() call that produced this redirect, exchanges the code, and connects.
     await this.finishAuthOnProvider(state, provider, url, signal);
     state.discovered = false;
     return `Authenticated with "${state.server.name}".`;
@@ -455,6 +616,22 @@ export class McpManager {
     await transport.finishAuth(code);
     await transport.close?.();
     await this.connectWithProvider(state, provider, signal, false);
+    await this.markConnected(state, signal);
+  }
+
+  /**
+   * `connectWithProvider` only sets `state.live`; it does not update status or
+   * tools the way `connectInternal` does. Both OAuth completion paths call it
+   * directly, so without this, a freshly authenticated server keeps reporting
+   * its pre-auth status (typically "needs-auth" with 0 tools) forever: `connect()`
+   * short-circuits on an existing `state.live` before `connectInternal` ever runs.
+   */
+  private async markConnected(state: ServerState, signal?: AbortSignal): Promise<void> {
+    if (!state.live) return;
+    await this.refreshTools(state, signal);
+    state.status = "connected";
+    state.error = undefined;
+    this.scheduleIdle(state);
   }
 
   private async connectInternal(state: ServerState, signal?: AbortSignal): Promise<void> {

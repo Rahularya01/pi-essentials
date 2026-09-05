@@ -5,12 +5,16 @@ import path from "node:path";
 import type { ResolvedSubagentsConfig } from "../config.ts";
 import { capBytes } from "../errors.ts";
 import { sanitizeEnv } from "../security/env.ts";
+import { applySessionEvent, emptyTrace, type TraceEvent } from "./activity.ts";
 import type { JsonSchema } from "./schema.ts";
 import type { AgentDefinition } from "./types.ts";
 import type { WorktreeMetadata } from "./worktree.ts";
 
 /** Grace period between SIGTERM and SIGKILL when a run is cancelled. */
 const KILL_GRACE_MS = 5_000;
+
+/** How long a finished run's event log survives, so a Herdr pane opened just after completion still works. */
+const LOG_RETENTION_MS = 60_000;
 
 export interface RunUsage {
   input: number;
@@ -48,6 +52,12 @@ export interface ActiveRun {
   task: string;
   startedAt: number;
   proc?: ReturnType<typeof spawn>;
+  /** One-line current action (tool or last assistant snippet). */
+  activity: string;
+  /** Structured live transcript for the inspector. */
+  events: TraceEvent[];
+  /** Raw NDJSON event log for this run, for the external Herdr inspector viewer. */
+  logFile?: string;
 }
 
 let runCounter = 0;
@@ -278,11 +288,41 @@ export async function runSubagent(options: {
       return;
     }
 
-    options.register?.({ id, agent: options.agent.name, task: options.task, startedAt, proc });
+    let logStream: fs.WriteStream | undefined;
+    let logDir: string | undefined;
+    let logFile: string | undefined;
+    try {
+      logDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-essentials-subagent-log-"));
+      logFile = path.join(logDir, "events.jsonl");
+      logStream = fs.createWriteStream(logFile, { mode: 0o600 });
+      logStream.write(`${JSON.stringify({ type: "__meta__", agent: options.agent.name, task: options.task })}\n`);
+    } catch {
+      // Best-effort; the Herdr inspector just won't be available for this run.
+    }
+
+    const trace = emptyTrace();
+    const run: ActiveRun = {
+      id,
+      agent: options.agent.name,
+      task: options.task,
+      startedAt,
+      proc,
+      activity: "",
+      events: trace.events,
+      logFile,
+    };
+    options.register?.(run);
+
+    const publish = () => {
+      run.activity = trace.activity;
+      run.events = trace.events;
+      options.onProgress?.(trace.activity || finalAssistantText(messages) || "(running…)");
+    };
 
     let buffer = "";
     const handleLine = (line: string) => {
       if (!line.trim()) return;
+      logStream?.write(`${line}\n`);
       let event: unknown;
       try {
         event = JSON.parse(line);
@@ -302,21 +342,22 @@ export async function runSubagent(options: {
         structuredOutput = rec.result?.details;
         return;
       }
-      if (rec.type !== "message_end" || !rec.message) return;
-      messages.push(rec.message);
-      if (rec.message.role === "assistant") {
-        usage.turns += 1;
-        accumulateUsage(usage, rec.message.usage);
-        if (rec.message.model) childModel = rec.message.model;
-        if (rec.message.errorMessage) error = rec.message.errorMessage;
-        else if (rec.message.stopReason === "error" || rec.message.stopReason === "aborted") {
-          error = `Subagent stopped with reason: ${rec.message.stopReason}.`;
+      const live = applySessionEvent(trace, rec);
+      if (rec.type === "message_end" && rec.message) {
+        messages.push(rec.message);
+        if (rec.message.role === "assistant") {
+          usage.turns += 1;
+          accumulateUsage(usage, rec.message.usage);
+          if (rec.message.model) childModel = rec.message.model;
+          if (rec.message.errorMessage) error = rec.message.errorMessage;
+          else if (rec.message.stopReason === "error" || rec.message.stopReason === "aborted") {
+            error = `Subagent stopped with reason: ${rec.message.stopReason}.`;
+          }
+        } else if (rec.message.role === "toolResult") {
+          accumulateUsage(usage, rec.message.usage);
         }
-      } else if (rec.message.role === "toolResult") {
-        // Tool results can carry usage from grandchildren; preserve it recursively.
-        accumulateUsage(usage, rec.message.usage);
       }
-      options.onProgress?.(finalAssistantText(messages) || "(running…)");
+      if (live || rec.type === "message_end") publish();
     };
 
     proc.stdout?.setEncoding("utf8");
@@ -354,6 +395,11 @@ export async function runSubagent(options: {
     proc.on("close", (code, closeSignal) => {
       if (buffer.trim()) handleLine(buffer);
       detach();
+      logStream?.end();
+      if (logDir) {
+        const cleanup = setTimeout(() => fs.rmSync(logDir, { recursive: true, force: true }), LOG_RETENTION_MS);
+        cleanup.unref?.();
+      }
       if (closeSignal && code === null) {
         error ??= `Subagent was terminated by ${closeSignal}.`;
         finish(1);

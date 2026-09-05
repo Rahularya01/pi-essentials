@@ -62,6 +62,8 @@ export interface SubagentsFeatureConfig {
   maxOutputBytes?: number;
   spawnBudget?: number;
   allowNested?: boolean;
+  /** Let the fleet/inspector open a running child in an external Herdr pane, if `herdr` is on PATH. */
+  herdr?: boolean;
 }
 
 export interface PiEssentialsFile {
@@ -106,6 +108,7 @@ export interface ResolvedSubagentsConfig {
   maxOutputBytes: number;
   spawnBudget: number;
   allowNested: boolean;
+  herdr: boolean;
 }
 
 export interface ResolvedConfig {
@@ -289,6 +292,7 @@ export function resolveConfig(file: PiEssentialsFile, warnings: string[] = []): 
       maxOutputBytes: positiveInt(subObj.maxOutputBytes, DEFAULT_SUBAGENT_OUTPUT_BYTES, 1024, 1024 * 1024),
       spawnBudget: positiveInt(subObj.spawnBudget, DEFAULT_SUBAGENT_SPAWN_BUDGET, 1, 64),
       allowNested: subObj.allowNested === true,
+      herdr: subObj.herdr !== false,
     },
     todos: { enabled: enabledFrom(file.todos ?? true, true) },
     questions: { enabled: enabledFrom(file.questions ?? true, true) },

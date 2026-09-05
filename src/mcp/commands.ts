@@ -2,7 +2,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { errorMessage } from "../errors.ts";
 import type { McpManager } from "./manager.ts";
 
-const USAGE = "Usage: /mcp [status|tools|reconnect [name]|auth <name>|disconnect [name]]";
+const USAGE =
+  "Usage: /mcp [status|tools|reconnect [name]|auth <name> [redirectUrl]|auth-start <name>|auth-complete <name> <redirectUrl>|logout <name>|disconnect [name]]";
 
 export function registerMcpCommands(
   pi: ExtensionAPI,
@@ -10,7 +11,7 @@ export function registerMcpCommands(
   onStatusChange?: (ctx: ExtensionContext) => void,
 ): void {
   pi.registerCommand("mcp", {
-    description: "Show MCP server status, list tools, reconnect, or start OAuth. Usage: /mcp [reconnect [name]|auth <name>]",
+    description: "Show MCP server status, list tools, reconnect, or manage OAuth. Usage: /mcp [reconnect [name]|auth-start <name>]",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = parts[0]?.toLowerCase();
@@ -49,10 +50,42 @@ export function registerMcpCommands(
           case "auth": {
             const name = parts[1];
             if (!name) {
-              ctx.ui.notify("Usage: /mcp auth <server>", "warning");
+              ctx.ui.notify("Usage: /mcp auth <server> [redirectUrl]", "warning");
               return;
             }
-            ctx.ui.notify(await manager.auth(name), "info");
+            ctx.ui.notify(await manager.auth(name, parts[2]), "info");
+            return;
+          }
+
+          case "auth-start": {
+            const name = parts[1];
+            if (!name) {
+              ctx.ui.notify("Usage: /mcp auth-start <server>", "warning");
+              return;
+            }
+            const { message } = await manager.authStart(name);
+            ctx.ui.notify(message, "info");
+            return;
+          }
+
+          case "auth-complete": {
+            const name = parts[1];
+            const redirectUrl = parts[2];
+            if (!name || !redirectUrl) {
+              ctx.ui.notify("Usage: /mcp auth-complete <server> <redirectUrl>", "warning");
+              return;
+            }
+            ctx.ui.notify(await manager.authComplete(name, { redirectUrl }), "info");
+            return;
+          }
+
+          case "logout": {
+            const name = parts[1];
+            if (!name) {
+              ctx.ui.notify("Usage: /mcp logout <server>", "warning");
+              return;
+            }
+            ctx.ui.notify(await manager.logout(name), "info");
             return;
           }
 

@@ -11,14 +11,18 @@ const MAX_SEARCH_MATCHES = 20;
 const MAX_LIST_TOOLS = 200;
 
 const McpParams = Type.Object({
-  action: StringEnum(["search", "describe", "call", "list", "status", "auth", "disconnect"] as const, {
-    description: "MCP action to perform",
-  }),
+  action: StringEnum(
+    ["search", "describe", "call", "list", "status", "auth", "auth-start", "auth-complete", "logout", "disconnect"] as const,
+    { description: "MCP action to perform" },
+  ),
   query: Type.Optional(Type.String({ description: "Search query (action=search)" })),
   tool: Type.Optional(Type.String({ description: "Prefixed or original tool name (describe/call)" })),
   args: Type.Optional(Type.Any({ description: "JSON object or JSON string of tool arguments (call)" })),
-  server: Type.Optional(Type.String({ description: "Server name (auth/disconnect)" })),
-  redirectUrl: Type.Optional(Type.String({ description: "OAuth callback URL to complete auth" })),
+  server: Type.Optional(Type.String({ description: "Server name (auth/auth-start/auth-complete/logout/disconnect)" })),
+  redirectUrl: Type.Optional(Type.String({ description: "OAuth callback URL to complete auth (auth or auth-complete)" })),
+  code: Type.Optional(
+    Type.String({ description: "OAuth authorization code, as an alternative to redirectUrl (action=auth-complete)" }),
+  ),
 });
 
 function formatTool(tool: CachedTool): string {
@@ -45,12 +49,13 @@ export function registerMcpTool(
     name: "mcp",
     label: "MCP",
     description:
-      "Discover and call MCP server tools without loading every tool schema into context. Search or list tools, describe one, then call it. Use auth when a server reports it needs OAuth.",
+      "Discover and call MCP server tools without loading every tool schema into context. Search or list tools, describe one, then call it. Use auth (or auth-start/auth-complete) when a server reports it needs OAuth.",
     promptSnippet: "Discover and call MCP tools on demand through a single proxy",
     promptGuidelines: [
       "Use mcp to search/list/describe/call MCP tools instead of assuming a dedicated tool exists for each MCP action.",
       "Call mcp with action=search or action=list before action=call so you use the prefixed tool name.",
-      "If mcp reports OAuth is required, call mcp with action=auth for that server before retrying.",
+      "If mcp reports OAuth is required, call mcp with action=auth for that server before retrying. Prefer auth-start (returns the URL immediately, completes in the background) over auth, which blocks up to 5 minutes.",
+      "If a headless session can't reach the automatic callback, finish with action=auth-complete and either redirectUrl (the full pasted callback URL) or code.",
     ],
     parameters: McpParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -128,6 +133,30 @@ export function registerMcpTool(
             onUpdate?.(toolText(`Starting OAuth for ${server}...`));
             const text = await manager.auth(server, params.redirectUrl, signal);
             return toolText(text, { action: "auth", server });
+          }
+
+          case "auth-start": {
+            const server = params.server?.trim();
+            if (!server) toolFailure("server is required for auth-start.", "MCP_BAD_ARGS");
+            const { authorizeUrl, message } = await manager.authStart(server, signal);
+            return toolText(message, { action: "auth-start", server, authorizeUrl });
+          }
+
+          case "auth-complete": {
+            const server = params.server?.trim();
+            if (!server) toolFailure("server is required for auth-complete.", "MCP_BAD_ARGS");
+            if (!params.redirectUrl && !params.code) {
+              toolFailure("auth-complete needs redirectUrl or code.", "MCP_BAD_ARGS");
+            }
+            const text = await manager.authComplete(server, { redirectUrl: params.redirectUrl, code: params.code }, signal);
+            return toolText(text, { action: "auth-complete", server });
+          }
+
+          case "logout": {
+            const server = params.server?.trim();
+            if (!server) toolFailure("server is required for logout.", "MCP_BAD_ARGS");
+            const text = await manager.logout(server);
+            return toolText(text, { action: "logout", server });
           }
 
           case "disconnect": {

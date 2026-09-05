@@ -1,4 +1,3 @@
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -9,7 +8,7 @@ import { SsrfError } from "../security/ssrf.ts";
 import { ActivityLog, activityWidget, fetchDetail, searchDetail } from "./activity.ts";
 import { formatPage, fetchPage, readCached } from "./fetch.ts";
 import { renderFetchCall, renderFetchResult, renderSearchCall, renderSearchResult } from "./render.ts";
-import { availableProviders, formatSearch, runSearch } from "./search.ts";
+import { formatSearch, runSearch } from "./search.ts";
 
 function describeError(error: unknown): string {
   if (error instanceof SsrfError) return `${error.message} (blocked for safety)`;
@@ -119,7 +118,7 @@ export function registerWeb(pi: ExtensionAPI, config: ResolvedConfig): void {
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web and return titles, URLs, and snippets. Use provider=auto unless you need a specific backend. Then fetch promising URLs with web_fetch.",
+      "Search the web and return titles, URLs, and snippets. Then fetch promising URLs with web_fetch.",
     promptSnippet: "Search the public web and return cited snippets",
     promptGuidelines: [
       "Use web_search for current or external information, then web_fetch for pages you actually need to read.",
@@ -136,11 +135,6 @@ export function registerWeb(pi: ExtensionAPI, config: ResolvedConfig): void {
       num_search_results: Type.Optional(
         Type.Integer({ minimum: 1, maximum: MAX_SEARCH_RESULTS, description: "Alias for numResults" }),
       ),
-      provider: Type.Optional(
-        StringEnum(["auto", "duckduckgo", "brave", "tavily", "exa", "jina", "searxng"] as const, {
-          description: "Search provider. auto uses the configured fallback chain.",
-        }),
-      ),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
       const query = params.query?.trim();
@@ -153,17 +147,15 @@ export function registerWeb(pi: ExtensionAPI, config: ResolvedConfig): void {
         const result = await activity.track(
           "search",
           query,
-          () => runSearch(query, searchCfg, params.provider, count, signal, allowedHosts),
+          () => runSearch(query, searchCfg, "auto", count, signal, allowedHosts),
           searchDetail,
         );
         renderActivity(ctx);
-        // An empty result set is an answer, not a failure.
-        return toolText(formatSearch(result), { provider: result.provider, hits: result.hits, query });
+        return toolText(formatSearch(result), { hits: result.hits, query });
       } catch (error) {
         renderActivity(ctx);
-        const chain = availableProviders(searchCfg).join(" → ");
         toolFailure(
-          `${describeError(error)} (configured chain: ${chain})`,
+          describeError(error),
           error instanceof PiEssentialsError ? error.code : "WEB_SEARCH_FAILED",
         );
       }

@@ -7,6 +7,7 @@ import { capBytes, isAbortError } from "../src/errors.ts";
 import { MAX_TODOS } from "../src/security/limits.ts";
 import { discoverAgents } from "../src/subagents/discover.ts";
 import { parseAgentMarkdown } from "../src/subagents/types.ts";
+import { applySessionEvent, emptyTrace, summarizeTool, summarizeToolArgs } from "../src/subagents/activity.ts";
 import {
   accumulateUsage,
   buildArgs,
@@ -466,6 +467,37 @@ describe("subagent runner", () => {
   });
 });
 
+describe("subagent live activity", () => {
+  it("summarizes tool args and strips secret-shaped fields", () => {
+    expect(summarizeTool("read", { path: "src/auth.ts" })).toBe("read · src/auth.ts");
+    expect(summarizeToolArgs({ apiKey: "sk-secret", token: "abc", command: "git log" })).toBe("git log");
+    expect(summarizeToolArgs({ password: "nope" })).toBeUndefined();
+  });
+
+  it("folds json-mode tool and text events into a live trace", () => {
+    const trace = emptyTrace();
+    expect(applySessionEvent(trace, { type: "tool_execution_start", toolName: "bash", args: { command: "git log" } })).toBe(true);
+    expect(trace.activity).toBe("bash · git log");
+    expect(trace.events.at(-1)).toEqual({ kind: "tool", name: "bash", args: "git log", status: "running" });
+
+    applySessionEvent(trace, {
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "The payment " },
+    });
+    applySessionEvent(trace, {
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "flow starts in checkout." },
+    });
+    expect(trace.activity).toContain("payment");
+    applySessionEvent(trace, { type: "message_end", message: { role: "assistant", content: [] } });
+    expect(trace.events.at(-1)).toMatchObject({ kind: "text", text: expect.stringContaining("payment") });
+
+    applySessionEvent(trace, { type: "tool_execution_end", toolName: "bash", isError: true });
+    expect(trace.events.find((event) => event.kind === "tool" && event.name === "bash")).toMatchObject({ status: "error" });
+    expect(trace.activity).toBe("bash failed");
+  });
+});
+
 describe("structured subagent schemas", () => {
   const root = { type: "object", properties: { root: { type: "boolean" } } };
   const task = { type: "object", properties: { task: { type: "string" } } };
@@ -556,31 +588,46 @@ describe("todo dependencies", () => {
 
 describe("mcp config", () => {
   it("rejects half-specified servers and reads shared settings", () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "pi-essentials-mcp2-"));
-    writeFileSync(
-      path.join(dir, ".mcp.json"),
-      JSON.stringify({
-        settings: { requestTimeoutMs: 4321, idleTimeout: 7 },
-        mcpServers: {
-          good: { command: "echo" },
-          empty: {},
-          both: { command: "echo", url: "https://example.com" },
-          badArgs: { command: "echo", args: "not-an-array" },
-          badTimeout: { command: "echo", requestTimeoutMs: -1 },
-          badHeaders: { url: "https://example.com", headers: { authorization: 42 } },
-          badProtocol: { url: "file:///tmp/server" },
-        },
-      }),
-    );
-    const { servers, warnings, settings } = loadMcpServers(dir);
-    expect(servers.map((s) => s.name)).toEqual(["good"]);
-    expect(settings).toEqual({ requestTimeoutMs: 4321, idleTimeout: 7 });
-    expect(warnings.join(" ")).toMatch(/empty/);
-    expect(warnings.join(" ")).toMatch(/both/);
-    expect(warnings.join(" ")).toMatch(/badArgs/);
-    expect(warnings.join(" ")).toMatch(/badTimeout/);
-    expect(warnings.join(" ")).toMatch(/badHeaders/);
-    expect(warnings.join(" ")).toMatch(/badProtocol/);
+    // loadMcpServers also reads real home-relative files (~/.config/mcp/mcp.json,
+    // ~/.agents/mcp.json, ~/.pi/agent/mcp.json); isolate HOME so a developer's own
+    // MCP config can't leak an extra server into this assertion.
+    const fakeHome = mkdtempSync(path.join(os.tmpdir(), "pi-essentials-fake-home-"));
+    const previousHome = process.env.HOME;
+    const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = fakeHome;
+    delete process.env.PI_CODING_AGENT_DIR;
+    try {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "pi-essentials-mcp2-"));
+      writeFileSync(
+        path.join(dir, ".mcp.json"),
+        JSON.stringify({
+          settings: { requestTimeoutMs: 4321, idleTimeout: 7 },
+          mcpServers: {
+            good: { command: "echo" },
+            empty: {},
+            both: { command: "echo", url: "https://example.com" },
+            badArgs: { command: "echo", args: "not-an-array" },
+            badTimeout: { command: "echo", requestTimeoutMs: -1 },
+            badHeaders: { url: "https://example.com", headers: { authorization: 42 } },
+            badProtocol: { url: "file:///tmp/server" },
+          },
+        }),
+      );
+      const { servers, warnings, settings } = loadMcpServers(dir);
+      expect(servers.map((s) => s.name)).toEqual(["good"]);
+      expect(settings).toEqual({ requestTimeoutMs: 4321, idleTimeout: 7 });
+      expect(warnings.join(" ")).toMatch(/empty/);
+      expect(warnings.join(" ")).toMatch(/both/);
+      expect(warnings.join(" ")).toMatch(/badArgs/);
+      expect(warnings.join(" ")).toMatch(/badTimeout/);
+      expect(warnings.join(" ")).toMatch(/badHeaders/);
+      expect(warnings.join(" ")).toMatch(/badProtocol/);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    }
   });
 });
 

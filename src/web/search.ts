@@ -1,5 +1,5 @@
 import type { ResolvedWebConfig, SearchProviderName } from "../config.ts";
-import { errorMessage, isAbortError, PiEssentialsError } from "../errors.ts";
+import { isAbortError, PiEssentialsError } from "../errors.ts";
 import { searchBrave } from "./providers/brave.ts";
 import { searchDuckDuckGo } from "./providers/duckduckgo.ts";
 import { searchExa } from "./providers/exa.ts";
@@ -68,34 +68,29 @@ export async function runSearch(
   }
 
   const chain = availableProviders(config);
-  const errors: string[] = [];
+  let lastEmpty: SearchResult | undefined;
+  let failed = 0;
   for (const name of chain) {
     if (signal?.aborted) throw new PiEssentialsError("Search was cancelled.", "WEB_SEARCH_CANCELLED");
     try {
       const result = await providerFn(name, config)(options);
-      if (result.hits.length > 0) {
-        if (errors.length > 0) result.notes = `Used ${name} after earlier failures: ${errors.join("; ")}`;
-        return result;
-      }
-      errors.push(`${name}: no results`);
+      if (result.hits.length > 0) return result;
+      lastEmpty = result;
     } catch (error) {
       // Cancellation is a caller decision, not a provider failure. In
       // particular, never continue the fallback chain after an aborted fetch.
       if (signal?.aborted || isAbortError(error)) {
         throw new PiEssentialsError("Search was cancelled.", "WEB_SEARCH_CANCELLED");
       }
-      errors.push(`${name}: ${errorMessage(error)}`);
+      failed += 1;
     }
   }
-  throw new PiEssentialsError(
-    `All search providers failed (${chain.join(" → ")}). ${errors.join(" | ")}`,
-    "WEB_SEARCH_FAILED",
-    true,
-  );
+  if (lastEmpty) return lastEmpty;
+  throw new PiEssentialsError(failed > 0 ? "Search failed." : "No search results.", "WEB_SEARCH_FAILED", true);
 }
 
 export function formatSearch(result: SearchResult): string {
-  const lines = [`Search (${result.provider}) for "${result.query}":`, ""];
+  const lines = [`Search for "${result.query}":`, ""];
   if (result.hits.length === 0) {
     lines.push("No results.");
   }

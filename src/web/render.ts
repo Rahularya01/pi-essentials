@@ -33,17 +33,14 @@ interface FetchDetails {
 }
 
 export function renderSearchCall(
-  args: { query?: string; provider?: string; numResults?: number },
+  args: { query?: string; numResults?: number },
   theme: Theme,
   context: RenderSlot,
 ): Text {
   return safeRender(
     () =>
       titleLine(theme, "web_search", args?.query ? `"${oneLine(args.query, 56)}"` : undefined) +
-      meta(theme, [
-        args?.provider && args.provider !== "auto" ? args.provider : undefined,
-        args?.numResults ? `${args.numResults} results` : undefined,
-      ]),
+      meta(theme, [args?.numResults ? `${args.numResults} results` : undefined]),
     "web_search",
     context,
   );
@@ -61,12 +58,11 @@ export function renderSearchResult(
       if (context.isError) return failLine(theme, oneLine(firstText(result) || "search failed", 96));
 
       const hits = result?.details?.hits ?? [];
-      const provider = result?.details?.provider;
       if (hits.length === 0) {
-        return `${theme.fg("warning", GLYPH.pending)} ${theme.fg("muted", "no results")}${meta(theme, [provider])}`;
+        return `${theme.fg("warning", GLYPH.pending)} ${theme.fg("muted", "no results")}`;
       }
 
-      const header = okLine(theme, theme.fg("text", `${hits.length} results`)) + meta(theme, [provider]);
+      const header = okLine(theme, theme.fg("text", `${hits.length} results`));
       const lines = hits.map(
         (hit, index) =>
           `${theme.fg("dim", `${index + 1}.`)} ${theme.fg("text", oneLine(hit.title, 60))}\n     ${theme.fg("mdLinkUrl", shortUrl(hit.url, 64))}`,

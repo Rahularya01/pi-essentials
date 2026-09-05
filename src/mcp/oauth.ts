@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import http from "node:http";
 import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
@@ -7,8 +6,7 @@ import type {
   OAuthClientMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { ensureDir, writePrivateFile } from "../config.ts";
-import { getOAuthStorePath, getPiEssentialsDir } from "../paths.ts";
+import { accountId, createFileStore, resolveCredentialStore } from "./credential-store.ts";
 
 interface StoredRecord {
   serverUrl: string;
@@ -17,29 +15,73 @@ interface StoredRecord {
   codeVerifier?: string;
 }
 
-interface StoreFile {
-  records: Record<string, StoredRecord>;
-}
-
 function storageKey(serverName: string, serverUrl: string): string {
   return `${serverName}|${serverUrl}`;
 }
 
-function loadStore(): StoreFile {
-  const filePath = getOAuthStorePath();
-  if (!fs.existsSync(filePath)) return { records: {} };
+/** Shared across FileOAuthProvider instances for the process lifetime, so a
+ *  second instance created for the same server (as the two-step auth-complete
+ *  flow does) sees what an earlier instance just persisted. `null` means
+ *  "confirmed absent", distinct from "not yet looked up". */
+const recordCache = new Map<string, StoredRecord | null>();
+
+function parseRecord(raw: string | undefined, expectedUrl: string): StoredRecord | undefined {
+  if (raw === undefined) return undefined;
   try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as StoreFile;
-    if (!parsed.records || typeof parsed.records !== "object") return { records: {} };
-    return parsed;
+    const parsed = JSON.parse(raw) as StoredRecord;
+    // A record whose URL no longer matches belongs to a server that moved; treat it as absent.
+    return parsed && parsed.serverUrl === expectedUrl ? parsed : undefined;
   } catch {
-    return { records: {} };
+    return undefined;
   }
 }
 
-function saveStore(store: StoreFile): void {
-  ensureDir(getPiEssentialsDir());
-  writePrivateFile(getOAuthStorePath(), `${JSON.stringify(store, null, 2)}\n`);
+async function readRecord(serverName: string, serverUrl: string): Promise<StoredRecord | undefined> {
+  const rawKey = storageKey(serverName, serverUrl);
+  if (recordCache.has(rawKey)) return recordCache.get(rawKey) ?? undefined;
+
+  const { store } = await resolveCredentialStore();
+  const account = store.backend === "keyring" ? accountId(rawKey) : rawKey;
+  let raw = await store.get(account);
+
+  if (raw === undefined && store.backend === "keyring") {
+    // One-way import of a plaintext entry from before the credential store existed.
+    const legacy = createFileStore();
+    const legacyRaw = await legacy.get(rawKey);
+    if (legacyRaw !== undefined) {
+      await store.set(account, legacyRaw);
+      await legacy.delete(rawKey);
+      raw = legacyRaw;
+    }
+  }
+
+  const record = parseRecord(raw, serverUrl);
+  recordCache.set(rawKey, record ?? null);
+  return record;
+}
+
+async function writeRecord(serverName: string, serverUrl: string, record: StoredRecord): Promise<void> {
+  const rawKey = storageKey(serverName, serverUrl);
+  const { store } = await resolveCredentialStore();
+  const account = store.backend === "keyring" ? accountId(rawKey) : rawKey;
+  await store.set(account, JSON.stringify(record));
+  recordCache.set(rawKey, record);
+}
+
+async function deleteRecord(serverName: string, serverUrl: string): Promise<void> {
+  const rawKey = storageKey(serverName, serverUrl);
+  const { store } = await resolveCredentialStore();
+  const account = store.backend === "keyring" ? accountId(rawKey) : rawKey;
+  await store.delete(account);
+  // A server not yet migrated to the keyring may still have a legacy plaintext
+  // entry; clear that too so logout actually removes every stored credential.
+  if (store.backend === "keyring") await createFileStore().delete(rawKey);
+  recordCache.set(rawKey, null);
+}
+
+/** Test-only: forget cached records so a test can observe a fresh read from the backing store. */
+export function resetOAuthCacheForTests(): void {
+  recordCache.clear();
 }
 
 export class FileOAuthProvider implements OAuthClientProvider {
@@ -55,42 +97,30 @@ export class FileOAuthProvider implements OAuthClientProvider {
     private readonly onRedirect?: (url: URL) => void,
   ) {}
 
-  private read(): StoredRecord {
-    const store = loadStore();
-    const record = store.records[storageKey(this.serverName, this.serverUrl)];
-    if (record && record.serverUrl !== this.serverUrl) {
-      return { serverUrl: this.serverUrl };
-    }
+  private async read(): Promise<StoredRecord> {
+    const record = await readRecord(this.serverName, this.serverUrl);
     return record ?? { serverUrl: this.serverUrl };
   }
 
-  private write(patch: Partial<StoredRecord>): void {
-    const store = loadStore();
-    const key = storageKey(this.serverName, this.serverUrl);
-    const current = store.records[key] ?? { serverUrl: this.serverUrl };
-    if (current.serverUrl !== this.serverUrl) {
-      store.records[key] = { serverUrl: this.serverUrl, ...patch };
-    } else {
-      store.records[key] = { ...current, ...patch, serverUrl: this.serverUrl };
-    }
-    saveStore(store);
+  private async write(patch: Partial<StoredRecord>): Promise<void> {
+    const current = await this.read();
+    await writeRecord(this.serverName, this.serverUrl, { ...current, ...patch, serverUrl: this.serverUrl });
   }
 
-  clientInformation(): OAuthClientInformation | undefined {
-    return this.staticClient ?? this.read().clientInformation;
+  async clientInformation(): Promise<OAuthClientInformation | undefined> {
+    return this.staticClient ?? (await this.read()).clientInformation;
   }
 
-  saveClientInformation(info: OAuthClientInformationFull): void {
-    this.write({ clientInformation: info });
+  async saveClientInformation(info: OAuthClientInformationFull): Promise<void> {
+    await this.write({ clientInformation: info });
   }
 
-  tokens(): OAuthTokens | undefined {
-    const tokens = this.read().tokens;
-    return tokens;
+  async tokens(): Promise<OAuthTokens | undefined> {
+    return (await this.read()).tokens;
   }
 
-  saveTokens(tokens: OAuthTokens): void {
-    this.write({ tokens, codeVerifier: undefined });
+  async saveTokens(tokens: OAuthTokens): Promise<void> {
+    await this.write({ tokens, codeVerifier: undefined });
   }
 
   redirectToAuthorization(authorizationUrl: URL): void {
@@ -104,21 +134,19 @@ export class FileOAuthProvider implements OAuthClientProvider {
     return url;
   }
 
-  saveCodeVerifier(codeVerifier: string): void {
+  async saveCodeVerifier(codeVerifier: string): Promise<void> {
     this.localVerifier = codeVerifier;
-    this.write({ codeVerifier });
+    await this.write({ codeVerifier });
   }
 
-  codeVerifier(): string {
-    const stored = this.localVerifier ?? this.read().codeVerifier;
+  async codeVerifier(): Promise<string> {
+    const stored = this.localVerifier ?? (await this.read()).codeVerifier;
     if (!stored) throw new Error("No PKCE code verifier is stored for this OAuth flow.");
     return stored;
   }
 
-  clearTokens(): void {
-    const store = loadStore();
-    delete store.records[storageKey(this.serverName, this.serverUrl)];
-    saveStore(store);
+  async clearTokens(): Promise<void> {
+    await deleteRecord(this.serverName, this.serverUrl);
     this.localVerifier = undefined;
   }
 }

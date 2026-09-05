@@ -92,7 +92,10 @@ describe("extension registration", () => {
 
     const notify = vi.fn();
     for (const handler of handlers) {
-      await handler({}, { hasUI: true, ui: { notify, setWidget: () => undefined }, sessionManager: {}, cwd: process.cwd() });
+      await handler(
+        {},
+        { hasUI: true, ui: { notify, setWidget: () => undefined, setStatus: () => undefined }, sessionManager: {}, cwd: process.cwd() },
+      );
     }
     // No warnings are expected for a clean checkout; the handler must stay silent.
     expect(notify.mock.calls.every(([message]) => !String(message).includes("undefined"))).toBe(true);

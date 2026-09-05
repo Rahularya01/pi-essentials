@@ -54,8 +54,8 @@ export class ActivityLog {
   }
 }
 
-export function searchDetail(result: { provider: string; hits: unknown[] }): string {
-  return `${result.provider} ${GLYPH.sep} ${result.hits.length} hits`;
+export function searchDetail(result: { hits: unknown[] }): string {
+  return `${result.hits.length} hits`;
 }
 
 export function fetchDetail(page: { totalChars: number }): string {

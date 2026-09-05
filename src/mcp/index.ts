@@ -12,6 +12,7 @@ export function registerMcp(pi: ExtensionAPI, config: ResolvedConfig): void {
   const manager = new McpManager(process.cwd(), config);
   let statusTimer: NodeJS.Timeout | undefined;
   let lastStatus: string | undefined;
+  let lastCtx: ExtensionContext | undefined;
 
   const refreshStatus = (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
@@ -24,8 +25,18 @@ export function registerMcp(pi: ExtensionAPI, config: ResolvedConfig): void {
   registerMcpTool(pi, manager, refreshStatus);
   registerMcpCommands(pi, manager, refreshStatus);
 
+  // authStart() returns immediately and finishes OAuth in the background; surface
+  // that completion (or failure) proactively instead of leaving it silent until
+  // the next unrelated status check.
+  manager.onAuthUpdate((_server, message) => {
+    if (!lastCtx?.hasUI) return;
+    lastCtx.ui.notify(message, "info");
+    refreshStatus(lastCtx);
+  });
+
   let warned = false;
   pi.on("session_start", async (_event, ctx) => {
+    lastCtx = ctx;
     manager.reset();
     if (!warned && manager.warnings.length > 0) {
       warned = true;
@@ -50,6 +61,7 @@ export function registerMcp(pi: ExtensionAPI, config: ResolvedConfig): void {
     if (statusTimer) clearInterval(statusTimer);
     statusTimer = undefined;
     if (ctx.hasUI) ctx.ui.setStatus("pi-essentials-mcp", undefined);
+    lastCtx = undefined;
     await manager.shutdown().catch(() => undefined);
   });
 }
