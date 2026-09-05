@@ -1,7 +1,7 @@
 # pi-essentials
 
-[![npm version](https://img.shields.io/npm/v/pi-essentials?logo=npm)](https://www.npmjs.com/package/pi-essentials)
-[![license](https://img.shields.io/npm/l/pi-essentials)](LICENSE)
+[![npm version](https://img.shields.io/npm/v/@rahularya01/pi-essentials?logo=npm)](https://www.npmjs.com/package/@rahularya01/pi-essentials)
+[![license](https://img.shields.io/npm/l/@rahularya01/pi-essentials)](LICENSE)
 [![CI](https://github.com/Rahularya01/pi-essentials/actions/workflows/ci.yml/badge.svg)](https://github.com/Rahularya01/pi-essentials/actions/workflows/ci.yml)
 [![Sponsor](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=github)](https://github.com/sponsors/Rahularya01)
 
@@ -39,7 +39,7 @@ Pi itself ships without these capabilities. `pi-essentials` registers them with 
 Install from npm:
 
 ```bash
-pi install npm:pi-essentials
+pi install npm:@rahularya01/pi-essentials
 ```
 
 Or install directly from GitHub:
@@ -58,15 +58,15 @@ Or add it to your global `~/.pi/agent/settings.json` or project `.pi/settings.js
 
 ```json
 {
-  "packages": ["npm:pi-essentials"]
+  "packages": ["npm:@rahularya01/pi-essentials"]
 }
 ```
 
-Restart Pi (or run `/reload`) after installation. To update the package later, use `pi update npm:pi-essentials`.
+Restart Pi (or run `/reload`) after installation. To update the package later, use `pi update npm:@rahularya01/pi-essentials`.
 
 ## Quick start
 
-1. Install the extension: `pi install npm:pi-essentials`.
+1. Install the extension: `pi install npm:@rahularya01/pi-essentials`.
 2. Configure any MCP servers you need in `.mcp.json` or `~/.config/mcp/mcp.json`.
 3. Start Pi. Type `/mcp` for an interactive server management hub, or `/todos` to view active tasks.
 4. Prompt Pi naturally — it will discover MCP tools on demand, perform web research, spawn subagents, and keep track of todos automatically.

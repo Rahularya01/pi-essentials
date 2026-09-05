@@ -1,5 +1,5 @@
 {
-  "name": "pi-essentials",
+  "name": "@rahularya01/pi-essentials",
   "version": "0.1.0",
   "description": "Cohesive Pi Coding Agent plugin: MCP, web access, subagents, todos, and ask-user questions.",
   "type": "module",
