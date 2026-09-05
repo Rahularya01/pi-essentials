@@ -12,13 +12,28 @@ const MAX_LIST_TOOLS = 200;
 
 const McpParams = Type.Object({
   action: StringEnum(
-    ["search", "describe", "call", "list", "status", "auth", "auth-start", "auth-complete", "logout", "disconnect"] as const,
+    [
+      "search",
+      "describe",
+      "call",
+      "list",
+      "status",
+      "enable",
+      "disable",
+      "auth",
+      "auth-start",
+      "auth-complete",
+      "logout",
+      "disconnect",
+    ] as const,
     { description: "MCP action to perform" },
   ),
   query: Type.Optional(Type.String({ description: "Search query (action=search)" })),
   tool: Type.Optional(Type.String({ description: "Prefixed or original tool name (describe/call)" })),
   args: Type.Optional(Type.Any({ description: "JSON object or JSON string of tool arguments (call)" })),
-  server: Type.Optional(Type.String({ description: "Server name (auth/auth-start/auth-complete/logout/disconnect)" })),
+  server: Type.Optional(
+    Type.String({ description: "Server name (enable/disable/auth/auth-start/auth-complete/logout/disconnect)" }),
+  ),
   redirectUrl: Type.Optional(Type.String({ description: "OAuth callback URL to complete auth (auth or auth-complete)" })),
   code: Type.Optional(
     Type.String({ description: "OAuth authorization code, as an alternative to redirectUrl (action=auth-complete)" }),
@@ -125,6 +140,20 @@ export function registerMcpTool(
             if (!manager.findTool(name)) await manager.ensureAllTools(signal);
             const text = await manager.callTool(name, params.args, signal);
             return toolText(text, { action: "call", tool: name });
+          }
+
+          case "enable": {
+            const server = params.server?.trim();
+            if (!server) toolFailure("server is required for enable.", "MCP_BAD_ARGS");
+            await manager.setServerDisabled(server, false);
+            return toolText(`Enabled MCP server "${server}".`, { action: "enable", server });
+          }
+
+          case "disable": {
+            const server = params.server?.trim();
+            if (!server) toolFailure("server is required for disable.", "MCP_BAD_ARGS");
+            await manager.setServerDisabled(server, true);
+            return toolText(`Disabled MCP server "${server}".`, { action: "disable", server });
           }
 
           case "auth": {

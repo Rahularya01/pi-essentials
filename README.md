@@ -1,29 +1,60 @@
 # pi-essentials
 
+[![npm version](https://img.shields.io/npm/v/pi-essentials?logo=npm)](https://www.npmjs.com/package/pi-essentials)
+[![license](https://img.shields.io/npm/l/pi-essentials)](LICENSE)
 [![CI](https://github.com/Rahularya01/pi-essentials/actions/workflows/ci.yml/badge.svg)](https://github.com/Rahularya01/pi-essentials/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=github)](https://github.com/sponsors/Rahularya01)
 
-A Pi Coding Agent package that combines MCP, web access, subagents, todos, and structured user questions in one plugin.
+**pi-essentials** (currently in beta) is a battery-included extensions bundle for the [Pi Coding Agent](https://pi.dev) that adds **Model Context Protocol (MCP)**, **Web access (search & fetch)**, **Subagents**, **Todos**, and **Structured user questions** in a single, lightweight plugin.
 
-Pi itself ships without these capabilities. `pi-essentials` registers them as a single extension with a shared config, shared limits, and independent modules. It does **not** wrap `pi-mcp-adapter`, `pi-web-access`, `pi-subagents`, or the juicesharp packages — it follows their proven patterns (proxy MCP tool, readability extraction, isolated child sessions, session-branch todos) with a smaller, security-first surface.
+Pi itself ships without these capabilities. `pi-essentials` registers them with a single shared configuration, zero external runtime bloat, and a security-first architecture. It does **not** wrap `pi-mcp-adapter`, `pi-web-access`, or juicesharp packages — it follows their proven patterns (proxy MCP tool, Readability extraction, isolated child sessions, session-branch todos) with a smaller, original surface.
 
-Compatibility is selective, not full OMP parity. This package does not provide Agent Hub or browser automation, and `web_fetch` does not download binary files.
+> Using Google Antigravity / Gemini models with Pi? Pair this with the companion provider extension [`pi-antigravity`](https://github.com/Rahularya01/pi-antigravity).
+
+## Contents
+
+- [Requirements](#requirements)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Commands](#commands)
+- [MCP (Model Context Protocol)](#mcp-model-context-protocol)
+- [Web access](#web-access)
+- [Subagents](#subagents)
+- [Todos](#todos)
+- [Ask the user](#ask-the-user)
+- [Terminal UI and panels](#terminal-ui-and-panels)
+- [Configuration](#configuration)
+- [Security](#security)
+- [Development](#development)
+- [Support the project](#support-the-project)
+- [License](#license)
+
+## Requirements
+
+- Node.js **22 or later** (uses native TypeScript type-stripping, zero build step required)
+- Pi Coding Agent (`@earendil-works/pi-coding-agent`) version **0.80.0 or later**
 
 ## Install
 
-From npm:
+Install from npm:
 
 ```bash
 pi install npm:pi-essentials
 ```
 
-From a local checkout:
+Or install directly from GitHub:
+
+```bash
+pi install git:github.com/Rahularya01/pi-essentials
+```
+
+Or from a local checkout:
 
 ```bash
 pi install /absolute/path/to/pi-essentials
 ```
 
-Or add it to `~/.pi/agent/settings.json` / `.pi/settings.json`:
+Or add it to your global `~/.pi/agent/settings.json` or project `.pi/settings.json`:
 
 ```json
 {
@@ -31,116 +62,43 @@ Or add it to `~/.pi/agent/settings.json` / `.pi/settings.json`:
 }
 ```
 
-Restart Pi, or run `/reload` if the package is already discovered.
+Restart Pi (or run `/reload`) after installation. To update the package later, use `pi update npm:pi-essentials`.
 
-Requires Node.js 22+ and Pi (`@earendil-works/pi-coding-agent`).
+## Quick start
 
-## Configuration
+1. Install the extension: `pi install npm:pi-essentials`.
+2. Configure any MCP servers you need in `.mcp.json` or `~/.config/mcp/mcp.json`.
+3. Start Pi. Type `/mcp` for an interactive server management hub, or `/todos` to view active tasks.
+4. Prompt Pi naturally — it will discover MCP tools on demand, perform web research, spawn subagents, and keep track of todos automatically.
 
-Create `~/.pi/agent/pi-essentials.json`, and optionally override it with `.pi/pi-essentials.json` in a project. Later files win. Malformed JSON is ignored with a warning.
+## Commands
 
-```json
-{
-  "mcp": true,
-  "web": true,
-  "subagents": true,
-  "todos": true,
-  "questions": true
-}
-```
+| Command | Description |
+|---|---|
+| `/mcp` | Interactive server management hub (or shows status table in non-interactive mode) |
+| `/mcp tools` | Connect and list all discovered tools across configured MCP servers |
+| `/mcp enable [server]` | Enable an MCP server (opens an interactive selector if omitted in TUI) |
+| `/mcp disable [server]` | Disable an MCP server (opens an interactive selector if omitted in TUI) |
+| `/mcp auth [server] [url]` | Authenticate an OAuth MCP server (interactive selector if omitted in TUI) |
+| `/mcp-auth [server]` | Dedicated shortcut to authenticate with an OAuth MCP server |
+| `/mcp auth-start <server>` | Initiate OAuth and output the authorization URL immediately |
+| `/mcp auth-complete <server> <url>` | Complete an OAuth flow with pasted redirect URL or code |
+| `/mcp reconnect [server]` | Reconnect a specific server or all active servers |
+| `/mcp logout <server>` | Clear stored OAuth credentials for a server |
+| `/mcp disconnect [server]` | Disconnect an active server or all servers |
+| `/todos` | Print current session todos grouped by status |
+| `/todos clear` | Clear todos in the current session branch |
+| `/subagents` | Open the interactive two-column fleet inspector |
+| `/subagents pane [id]` | Open a running child subagent in an external Herdr pane |
+| `/subagents cancel <id\|all>` | Cancel running subagent tasks |
+| `/web` | Show recent web search and fetch activity (timing, size, outcome) |
+| `/web clear` | Clear web activity log |
 
-Disable one capability:
+All `/mcp` subcommands and server names support **Tab autosuggestions**.
 
-```json
-{
-  "mcp": false,
-  "web": { "enabled": true, "search": { "provider": "auto", "braveApiKey": "BSA_..." } },
-  "subagents": { "enabled": true, "maxConcurrency": 4, "spawnBudget": 16 },
-  "todos": true,
-  "questions": true
-}
-```
+## MCP (Model Context Protocol)
 
-Files are merged key by key, so a project file can override a single nested option
-(`web.search.maxResults`) without discarding the rest of the user file. Unknown keys
-produce a startup warning instead of being silently dropped.
-
-| Option | Default | Meaning |
-|---|---|---|
-| `mcp.requestTimeoutMs` | `30000` | Per-request MCP timeout |
-| `mcp.idleTimeoutMs` | `600000` | Disconnect an idle MCP server after this long |
-| `web.search.provider` | `"auto"` | Force one backend, or use the fallback chain |
-| `web.search.timeoutMs` | `15000` | Per-request search timeout |
-| `web.search.maxResults` | `5` | Default result count (1-20) |
-| `web.fetch.timeoutMs` | `15000` | Per-request fetch timeout |
-| `web.fetch.maxBytes` | `2097152` | Download cap before the page is cut short |
-| `web.fetch.maxChars` | `32000` | Characters returned per call |
-| `web.fetch.jinaFallback` | `true` | Retry a failed fetch through `r.jina.ai` |
-| `web.allowedHosts` | `[]` | Private hosts to trust, as `host` or `host:port` |
-| `subagents.maxConcurrency` | `4` | Children running at once in parallel mode |
-| `subagents.maxParallel` | `8` | Tasks accepted in one parallel call |
-| `subagents.maxOutputBytes` | `51200` | UTF-8 byte cap on each child's returned answer |
-| `subagents.spawnBudget` | `16` | Children per session |
-| `subagents.allowNested` | `false` | Let a child spawn its own children |
-| `subagents.herdr` | `true` | Allow opening a running child in an external Herdr pane |
-
-API keys may also come from `BRAVE_API_KEY`, `TAVILY_API_KEY`, `EXA_API_KEY`, `JINA_API_KEY`, and `SEARXNG_URL`.
-
-See [`examples/pi-essentials.json`](examples/pi-essentials.json) and [`examples/pi-settings.json`](examples/pi-settings.json).
-
-## Terminal UI
-
-Every tool renders one compact row: what it did, then dimmed metadata. Detail is
-available on demand with `ctrl+o` rather than printed by default.
-
-```
-web_search "typescript readable streams"
-✓ 4 results
-  1. Stream | Node.js v26 Documentation
-     nodejs.org/api/stream.html
-  2. Backpressure in Streams
-     nodejs.org/en/learn/modules/backpressuring-in-streams
-  +2 more results · ctrl+o to expand
-```
-
-```
-subagent scout, reviewer · parallel ×2
-✓ 1/2 finished · 18.4s · 14.5k→930 tok · $0.035
-  ✓ scout · 18.4s · 4 turns
-  ✗ reviewer · 4.2s · 1 turn · no API key
-  ctrl+o to read the answers
-```
-
-Three panels sit around the editor and each collapses to a single line:
-
-| Panel | Where | Toggle |
-|---|---|---|
-| Todos | above the editor | `ctrl+shift+t` |
-| Subagent fleet | below the editor | `ctrl+shift+a` |
-| Web activity | below the editor | `ctrl+shift+w` |
-
-```
-── Todos ───────────────────────────── ▪▪▪▪▫▫▫▫▫▫ 2/5
-  ▶ #3 Wire the activity panel
-  ○ #4 Update the README · needs #3
-  ✓ #1 R̶e̶a̶d̶ ̶t̶h̶e̶ ̶d̶o̶c̶s̶
-  +1 more (1 completed)
-
-  2 running agents · 5/16 spawned · ↓/← to inspect
-
-── Web activity ───────────────────────────── 3 recent
-  FETCH  blog.example.com/gone      HTTP 404       260ms ✗
-  FETCH  nodejs.org/api/stream.html 194.8k chars   812ms ✓
-  SEARCH "typescript streams"       5 hits  2.1s ✓
-```
-
-Panels appear only when they have something to say, and an overflow line names
-what it dropped (`+2 more (1 completed, 1 pending)`) rather than hiding it
-silently. A footer status shows MCP health: `⚡ mcp 2/3 · 1 need auth`.
-
-## MCP
-
-Reads standard MCP files, later winning:
+Reads standard MCP configuration files, with project-level files overriding user-level files:
 
 1. `~/.config/mcp/mcp.json`
 2. `~/.agents/mcp.json`
@@ -149,13 +107,15 @@ Reads standard MCP files, later winning:
 5. `.mcp.json`
 6. `.pi/mcp.json`
 
-Supports stdio (`command`/`args`) and HTTP (`url`), with Streamable HTTP then SSE fallback. Servers are **lazy** by default: they start on first use and idle-disconnect. One proxy tool keeps MCP schemas out of the parent context.
+Supports stdio (`command`/`args`) and HTTP (`url`), with Streamable HTTP and automatic SSE fallback. Servers are **lazy** by default: they start on first use and automatically disconnect after an idle timeout. One proxy tool keeps MCP schemas out of the model's context until needed.
 
 ```js
 mcp({ action: "search", query: "screenshot" })
 mcp({ action: "describe", tool: "chrome_devtools_take_screenshot" })
 mcp({ action: "call", tool: "chrome_devtools_take_screenshot", args: { format: "png" } })
 mcp({ action: "status" })
+mcp({ action: "enable", server: "linear" })
+mcp({ action: "disable", server: "linear" })
 mcp({ action: "auth", server: "linear" })
 mcp({ action: "auth-start", server: "linear" })
 mcp({ action: "auth-complete", server: "linear", redirectUrl: "http://127.0.0.1:5173/callback?code=...&state=..." })
@@ -169,34 +129,13 @@ Servers can share defaults through a `settings` block in the same file:
 { "settings": { "requestTimeoutMs": 30000, "idleTimeout": 10 }, "mcpServers": { } }
 ```
 
-Commands: `/mcp` (status table), `/mcp tools`, `/mcp reconnect [name]`, `/mcp auth <name> [redirectUrl]`, `/mcp auth-start <name>`, `/mcp auth-complete <name> <redirectUrl>`, `/mcp logout <name>`, `/mcp disconnect [name]`. A footer entry tracks connection health while the session runs.
-
-Tool discovery connects lazily and in parallel, and leaves healthy connections
-alone. Calls include MCP `structuredContent` as formatted JSON, without repeating
-it when the same JSON is already present in a text part. If an unprefixed tool
-name exists on multiple servers, the call fails with the valid prefixed names;
-server results marked `isError` are surfaced as real tool errors. Binary results
-(screenshots, audio, blobs) are summarized rather than pasted into the parent
-context as base64.
-
-OAuth uses PKCE and a local loopback callback. `auth` runs the whole flow in one
-blocking call (up to 5 minutes waiting for the browser). `auth-start` returns the
-authorization URL immediately and finishes in the background if the callback
-arrives; otherwise finish explicitly with `auth-complete` and either the full
-pasted `redirectUrl` (works even from a different call or session, since the PKCE
-verifier is read back from storage) or a bare `code` (only within the same
-process, since that needs the exact redirect URI `auth-start` advertised).
-`logout` clears stored credentials for a server. Tokens prefer the OS credential
-store (macOS Keychain, Windows Credential Manager, Linux Secret Service) and fall
-back to a local file (`~/.pi/agent/pi-essentials/mcp-oauth.json`, mode `0600`)
-when none is available, importing any existing plaintext entry into the
-credential store the first time it becomes available. Bearer tokens and header
-env interpolation (`${VAR}`, `$env:VAR`) are supported. Command-substitution
-secrets (`!cmd`) are not.
+- **Autosuggestions & Dialogs:** Typing `/mcp <Tab>` suggests subcommands; `/mcp enable <Tab>` or `/mcp auth <Tab>` suggests servers. Running `/mcp enable` or `/mcp disable` without arguments in the TUI opens an interactive selector (`ctx.ui.select`).
+- **Persistent Overrides:** Toggling server status via `/mcp enable` or `/mcp disable` persists the setting in `.pi/mcp.json` without modifying the global config file.
+- **OAuth Security:** Uses PKCE and a temporary loopback callback. Tokens prefer the OS credential store (macOS Keychain, Windows Credential Manager, Linux Secret Service) with fallback to a strict mode `0600` file (`~/.pi/agent/pi-essentials/mcp-oauth.json`).
 
 Example server file: [`examples/mcp.json`](examples/mcp.json).
 
-## Web
+## Web access
 
 ```js
 web_search({ query: "TypeScript Pi coding agent extensions", numResults: 5 })
@@ -205,42 +144,9 @@ web_fetch({ url: "https://example.com/long", offset: 32000, limit: 8000 })
 web_fetch({ cacheId: "abc123", offset: 32000, limit: 8000 })
 ```
 
-`web_search` accepts `numResults`, `limit`, and `num_search_results` as
-result-count spellings (1-20). If more than one is supplied, precedence is
-`numResults` → `limit` → `num_search_results`; otherwise `web.search.maxResults`
-is used. The fallback chain (skipping unconfigured providers) is SearXNG → Brave
-→ Tavily → Exa → Jina → DuckDuckGo.
-
-`/web` shows what the web tools actually did this session (size, timing,
-outcome) and `/web clear` empties it. The backend name is not shown in the TUI.
-
-`web_fetch` requires exactly one of `url` or `cacheId`; supplying both or neither
-is an error. It extracts readable markdown (Readability), truncates large pages, and
-caches the full text for one hour. Headings, ordered and nested lists, tables, and
-fenced code survive the conversion. `offset`/`limit` work on a fresh fetch as well
-as on a `cacheId`, and every truncated result names the exact follow-up call.
-Responses are decoded using the charset the server declares, and binary responses
-are refused with a clear message instead of returned as mojibake.
-
-JavaScript from pages is never executed. Private, loopback, link-local, CGNAT, and
-cloud-metadata addresses are blocked in both IPv4 and IPv6 form, including
-compressed and IPv4-mapped spellings, and the check is re-applied to every
-redirect hop.
-
-Requests connect to the exact addresses the safety check validated, so a hostile
-resolver cannot return a public address to the check and a private one to the
-socket (DNS rebinding). TLS still verifies the certificate against the real
-hostname.
-
-To reach a deliberately private service, list it in `web.allowedHosts`:
-
-```json
-{ "web": { "allowedHosts": ["localhost:8888", "10.0.0.5"] } }
-```
-
-A host configured through `web.search.searxngUrl` is trusted automatically, so a
-self-hosted SearXNG on localhost works without extra setup. Entries with a port
-apply to that port only.
+- **`web_search`**: Supports query aliases (`numResults`, `limit`, `num_search_results`). Fallback chain across unconfigured providers: SearXNG → Brave → Tavily → Exa → Jina → DuckDuckGo.
+- **`web_fetch`**: Requires either `url` or `cacheId`. Extracts clean markdown using Mozilla Readability, truncates large pages gracefully, and caches full text for one hour.
+- **SSRF Hardened**: Never executes page JavaScript. Blocks private, loopback, link-local, CGNAT, and cloud-metadata addresses on every redirect hop, with DNS-pinning to prevent rebinding attacks. Trust private services explicitly via `web.allowedHosts`.
 
 ## Subagents
 
@@ -270,41 +176,10 @@ subagent({
 })
 ```
 
-Builtin agents: `scout`, `reviewer`, `worker`, `oracle`. Override or add agents as markdown files in `~/.pi/agent/agents/` (and `.pi/agents/` with `agentScope: "project"` or `"both"` after trust). Frontmatter accepts `name`, `description`, `model`, and `tools` (inline `[a, b]`, `- a` block lists, or a comma-separated string).
-
-Children run as isolated `pi --mode json --no-session` processes. They get the task
-text only and do not load this package's MCP, todo, or question tools. Their
-environment is stripped of `MCP_*`, `*_TOKEN`, `*_SECRET`, and third-party
-`*_API_KEY` values; the model-provider credentials pi itself needs
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and the rest of pi's provider table) are
-forwarded, because without them the child cannot authenticate at all.
-
-Unknown agent names and over-budget requests are rejected before anything is
-spawned, so a typo does not consume the session's spawn budget.
-
-`outputSchema` is a TypeBox/JSON object schema. A top-level schema is the default
-for every job, and a schema on a `tasks`/`chain` item overrides it. The child must
-submit one validated `subagent_result`; its structured object is returned in tool
-details (and serialized into `{previous}` for the next chain step).
-
-`isolation: "worktree"` requires a clean Git source repository and runs against a
-temporary detached worktree at the current `HEAD`. Single and parallel jobs get
-separate worktrees; isolated steps in a chain share one so later steps see earlier
-changes. The source checkout is never modified automatically. After the run, the
-temporary worktree is removed and result details report changed files plus a
-binary-capable patch artifact path; the patch is **not** auto-applied.
-
-With the editor empty, press `↓` or `←` to expand the fleet roster, then `Enter` (or click a row) to open a near-fullscreen live inspector — the same flow as pi-subagents. The inspector is a bordered, two-column frame: a roster on the left and the selected child's live task/tool/text transcript on the right, matching pi-subagents' Fleet inspector layout rather than a single stacked list. `j`/`k` switches children, `pgup`/`pgdn` scrolls the transcript, Esc closes. `/subagents` opens that inspector while work is running. Ctrl+O on the running tool card expands the live tool stream. No steering or session takeover.
-
-Press `h` in the roster or the inspector (or run `/subagents pane [id]`) to open the
-selected child in a real, separate [Herdr](https://github.com/herdrdev/herdr) pane
-instead of the in-app overlay — the same "new window" experience pi-subagents offers
-through its own Herdr integration. This is entirely optional and best-effort: if
-`herdr` isn't on PATH (or `subagents.herdr` is set to `false`), pi-essentials just
-notifies you and keeps using the in-app inspector. The pane is read-only (no steer,
-no stop) and runs a small standalone script that tails the child's own event log; it
-never receives model- or task-controlled text as a shell argument, only paths this
-package generates itself.
+- **Built-in Agents**: `scout`, `reviewer`, `worker`, `oracle`. Custom agents can be added as markdown files in `~/.pi/agent/agents/` or `.pi/agents/`.
+- **Isolated Sessions**: Children run as separate `pi --mode json --no-session` child processes with sanitized environments (`MCP_*` and API secrets stripped; model credentials forwarded).
+- **Worktree Isolation**: `isolation: "worktree"` runs work against a temporary detached Git worktree at `HEAD`, returning changed files and a clean patch artifact without modifying your working tree.
+- **Live Fleet Inspector**: Press `↓` or `←` with the editor empty to expand the fleet roster, or run `/subagents` to open a two-column interactive live transcript inspector. Press `h` (or `/subagents pane [id]`) to open the child in an external [Herdr](https://github.com/herdrdev/herdr) pane.
 
 ## Todos
 
@@ -317,24 +192,10 @@ todo({ action: "complete", id: 1 })
 todo({ action: "list" })
 ```
 
-Statuses are `pending`, `in_progress`, `completed`, `blocked`, and `abandoned`.
-Actions are `list`, `create`, `update`, `complete`, `reopen`, `block`, `unblock`,
-`abandon`, `delete`, `clear`, and `sync`. `phase` and `blocker` are optional
-metadata; `blockedBy` stores dependency IDs.
-
-`sync` atomically replaces the complete list from a `todos` snapshot. It preserves
-the supplied IDs, dependencies, phases, blockers, and statuses, validates missing
-references/cycles and the single-`in_progress` rule, then allocates future IDs
-above the highest supplied ID. Ordinary updates retain IDs and dependencies unless
-they are explicitly changed.
-
-State is reconstructed from the current session branch, so it survives `/reload`,
-compaction, and `/tree` navigation. `blockedBy` dependencies are validated for
-missing ids and cycles; selecting a still-blocked item as `in_progress` returns a
-warning, while selecting a second `in_progress` item atomically moves the previous
-one back to `pending`. Completing an item reports what it unblocked. `/todos`
-prints the list and `/todos clear` empties it, grouped by status. A panel above the
-editor shows unfinished work first, with completed rows struck through.
+- **Status Workflow**: `pending`, `in_progress`, `completed`, `blocked`, `abandoned`.
+- **Session-Branch Persistence**: State is tied to the active session tree branch, surviving `/reload`, compaction, and `/tree` navigation.
+- **Dependency Tracking**: `blockedBy` enforces valid DAG relationships, rejecting cycles and warning when selecting a blocked task. Completing an item automatically announces unblocked tasks.
+- **Interactive Panel**: Displays an unobtrusive checklist widget right above the editor.
 
 ## Ask the user
 
@@ -357,46 +218,104 @@ ask_user_question({
 })
 ```
 
-Options are presented numbered, so a selection is matched by position rather than
-by re-parsing its label. `id` is echoed in result details, and an option's `value`
-provides its machine-readable answer (falling back to its label). `recommended` is
-a validated zero-based metadata index; Pi's current selector does not display or
-preselect it. `allowOther` defaults to `true` and controls the free-text path. `multiple` is
-an alias for `multiSelect`; if both are present they must agree.
+- Prompts the user with an interactive modal in the terminal when a real human decision is required.
+- Supports single-choice, multi-select, and custom write-in answers.
+- Erased automatically in non-interactive/headless runs.
 
-With either multi-select spelling enabled, the user keeps picking until choosing
-**Done**. Result details include each answer's `id`, question/header, selected
-labels, option values, zero-based indices, and any custom text. The tool waits for
-the answer, then the parent turn continues. It is removed from the model tool list
-in non-interactive runs.
+## Terminal UI and panels
+
+Three contextual panels wrap around the editor, collapsing to a single line when idle:
+
+| Panel | Placement | Shortcut | Purpose |
+|---|---|---|---|
+| Todos | Above editor | `ctrl+shift+t` | Live progress bar and task checklist |
+| Subagent fleet | Below editor | `ctrl+shift+a` | Active child runs, token counts, and costs |
+| Web activity | Below editor | `ctrl+shift+w` | Search queries, HTTP status, and fetch sizes |
+| Tool output expand | Tool card | `ctrl+o` | Expand compact tool result into full detail |
+
+```
+── Todos ───────────────────────────── ▪▪▪▪▫▫▫▫▫▫ 2/5
+  ▶ #3 Wire the activity panel
+  ○ #4 Update the README · needs #3
+  ✓ #1 R̶e̶a̶d̶ ̶t̶h̶e̶ ̶d̶o̶c̶s̶
+  +1 more (1 completed)
+
+  2 running agents · 5/16 spawned · ↓/← to inspect
+
+── Web activity ───────────────────────────── 3 recent
+  FETCH  blog.example.com/gone      HTTP 404       260ms ✗
+  FETCH  nodejs.org/api/stream.html 194.8k chars   812ms ✓
+  SEARCH "typescript streams"       5 hits  2.1s ✓
+```
+
+A live footer widget tracks MCP connection status: `⚡ mcp 2/3 · 1 need auth`.
+
+## Configuration
+
+Create `~/.pi/agent/pi-essentials.json`, and optionally override it with `.pi/pi-essentials.json` per project. Later files win.
+
+```json
+{
+  "mcp": true,
+  "web": {
+    "enabled": true,
+    "search": { "provider": "auto", "braveApiKey": "BSA_..." }
+  },
+  "subagents": { "enabled": true, "maxConcurrency": 4, "spawnBudget": 16 },
+  "todos": true,
+  "questions": true
+}
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `mcp.requestTimeoutMs` | `30000` | Per-request MCP timeout in milliseconds |
+| `mcp.idleTimeoutMs` | `600000` | Disconnect an idle MCP server after this duration (10 min) |
+| `web.search.provider` | `"auto"` | Force a search provider or use the fallback chain |
+| `web.search.timeoutMs` | `15000` | Per-request search timeout |
+| `web.search.maxResults` | `5` | Default number of search results returned (1-20) |
+| `web.fetch.timeoutMs` | `15000` | Per-request fetch timeout |
+| `web.fetch.maxBytes` | `2097152` | Download cap before page download is cut short (2 MB) |
+| `web.fetch.maxChars` | `32000` | Maximum characters returned to the model per call |
+| `web.fetch.jinaFallback` | `true` | Retry failed page fetches via `r.jina.ai` |
+| `web.allowedHosts` | `[]` | Private hosts to deliberately trust, as `host` or `host:port` |
+| `subagents.maxConcurrency` | `4` | Maximum child subagents executing simultaneously |
+| `subagents.maxParallel` | `8` | Maximum tasks allowed in a single parallel call |
+| `subagents.maxOutputBytes` | `51200` | UTF-8 byte cap on returned subagent answers (50 KB) |
+| `subagents.spawnBudget` | `16` | Total children allowed per session |
+| `subagents.allowNested` | `false` | Allow children to spawn their own subagents |
+| `subagents.herdr` | `true` | Allow opening a child in an external Herdr pane |
+
+Environment variables for search backends: `BRAVE_API_KEY`, `TAVILY_API_KEY`, `EXA_API_KEY`, `JINA_API_KEY`, and `SEARXNG_URL`.
+
+See [`examples/pi-essentials.json`](examples/pi-essentials.json) and [`examples/pi-settings.json`](examples/pi-settings.json).
 
 ## Security
 
-- No `eval`, no install/postinstall scripts, no shell interpolation of untrusted input (`spawn` argv arrays only).
-- Downloaded web content is parsed as HTML/text, never executed.
-- Network fetches validate DNS, block private ranges on every redirect hop, and
-  connect only to the addresses that were validated (no DNS-rebinding window).
-- Compressed responses are bounded by both a compressed and a decompressed cap,
-  so a decompression bomb cannot exhaust memory.
-- MCP and web operations have timeouts and response size caps. Binary MCP content
-  is summarized rather than pasted into context.
-- Subagents do not inherit parent transcripts or MCP secrets. Only the
-  model-provider credentials pi needs to run are forwarded.
-- Tool failures are raised, so pi reports them to the model as errors rather than
-  as prose that merely looks like one.
+- **Safe Execution**: No `eval`, no install/postinstall scripts, no shell interpolation of untrusted input (`spawn` argv arrays only).
+- **Web Safety**: HTML/text parsing only; JavaScript is never executed. Strict DNS resolution checks with IP pinning prevent DNS rebinding and SSRF into private networks.
+- **Decompression Protection**: Bounded by both compressed and decompressed size limits to prevent decompression bombs.
+- **Subagent Sandboxing**: Children run with clean environments stripped of MCP secrets and third-party tokens. Only necessary provider credentials are forwarded.
+- **Zero Silent Failures**: Tool errors throw explicitly so Pi registers them as genuine errors rather than misleading assistant text.
 
 ## Development
 
 ```bash
 npm install
-npm run check     # typecheck + tests
+npm run check     # typecheck + test suite
 npm test
 npm run typecheck
 ```
 
+See [AGENTS.md](AGENTS.md) for architectural invariants and development rules.
+
+## Support the project
+
+If `pi-essentials` is useful to you, consider [sponsoring the project on GitHub](https://github.com/sponsors/Rahularya01).
+
 ## License
 
-MIT
+[MIT](LICENSE)
 
 ## Community
 

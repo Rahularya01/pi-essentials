@@ -53,7 +53,7 @@ describe("extension registration", () => {
       piEssentials(h.pi as never);
     });
     expect(h.tools.sort()).toEqual(["ask_user_question", "mcp", "subagent", "todo", "web_fetch", "web_search"]);
-    expect(h.commands.sort()).toEqual(["mcp", "subagents", "todos", "web"]);
+    expect(h.commands.sort()).toEqual(["mcp", "mcp-auth", "subagents", "todos", "web"]);
     expect(h.shortcuts.sort()).toEqual(["ctrl+shift+a", "ctrl+shift+t", "ctrl+shift+w"]);
     expect(h.events).toContain("session_start");
     expect(h.events).toContain("session_shutdown");

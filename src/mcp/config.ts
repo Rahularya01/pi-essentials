@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import type { McpFileShape, McpServerDefinition, ResolvedServer } from "./types.ts";
 import { mcpConfigCandidates } from "../paths.ts";
 
@@ -22,11 +23,11 @@ function optionalString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string";
 }
 
-function asServer(value: unknown): { definition?: McpServerDefinition; problem?: string } {
+function asServer(value: unknown, isOverride = false): { definition?: McpServerDefinition; problem?: string } {
   if (!isObject(value)) return { problem: "entry is not an object" };
   const command = typeof value.command === "string" && value.command.trim() ? value.command : undefined;
   const url = typeof value.url === "string" && value.url.trim() ? value.url : undefined;
-  if (!command && !url) return { problem: 'entry needs either "command" (stdio) or "url" (http)' };
+  if (!command && !url && !isOverride) return { problem: 'entry needs either "command" (stdio) or "url" (http)' };
   if (command && url) return { problem: 'entry sets both "command" and "url"; use one transport' };
   if (url) {
     try {
@@ -110,16 +111,43 @@ export function loadMcpServers(cwd: string): {
         warnings.push(`Skipping MCP server with an empty name in ${filePath}`);
         continue;
       }
-      const { definition, problem } = asServer(raw);
+      const existing = byName.get(name);
+      const { definition, problem } = asServer(raw, Boolean(existing));
       if (!definition) {
         warnings.push(`Skipping MCP server "${name}" in ${filePath}: ${problem}`);
         continue;
       }
       // Later files intentionally override earlier ones (project beats user).
-      byName.set(name, { name, definition, source: filePath });
+      const mergedDef: McpServerDefinition = existing
+        ? { ...existing.definition, ...definition }
+        : definition;
+      byName.set(name, { name, definition: mergedDef, source: filePath });
     }
   }
   return { servers: [...byName.values()], warnings, settings };
+}
+
+export function saveProjectMcpOverride(
+  cwd: string,
+  serverName: string,
+  patch: Partial<McpServerDefinition>,
+): void {
+  const dir = path.join(cwd, ".pi");
+  const filePath = path.join(dir, "mcp.json");
+  let content: McpFileShape = {};
+  if (fs.existsSync(filePath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
+      if (isObject(parsed)) content = parsed as McpFileShape;
+    } catch {
+      content = {};
+    }
+  }
+  content.mcpServers = content.mcpServers ?? {};
+  const current = content.mcpServers[serverName] ?? {};
+  content.mcpServers[serverName] = { ...current, ...patch };
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(content, null, 2)}\n`, "utf8");
 }
 
 export function serverTransport(def: McpServerDefinition): "stdio" | "http" | "unknown" {

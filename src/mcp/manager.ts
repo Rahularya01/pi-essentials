@@ -8,7 +8,7 @@ import type { ResolvedConfig } from "../config.ts";
 import { capText, errorMessage, isAbortError, PiEssentialsError } from "../errors.ts";
 import { interpolateEnvValue, interpolateRecord, timeoutSignal } from "../security/env.ts";
 import { CONNECT_TIMEOUT_MS, MAX_TOOL_RESULT_CHARS } from "../security/limits.ts";
-import { loadMcpServers, serverTransport } from "./config.ts";
+import { loadMcpServers, saveProjectMcpOverride, serverTransport } from "./config.ts";
 import { FileOAuthProvider, maybeOpenUrl, startLoopbackCallback, type LoopbackCallback } from "./oauth.ts";
 import type { CachedTool, McpFileShape, ResolvedServer, ServerSnapshot, ServerStatus } from "./types.ts";
 
@@ -232,6 +232,26 @@ export class McpManager {
       error: state.error,
       source: state.server.source,
     }));
+  }
+
+  getOAuthServers(): ServerSnapshot[] {
+    return this.listServers().filter((s) => s.transport === "http");
+  }
+
+  async setServerDisabled(name: string, disabled: boolean, persist = true): Promise<void> {
+    const state = this.requireServer(name);
+    state.server.definition.disabled = disabled;
+    if (disabled) {
+      await this.disconnectState(state);
+      state.status = "disabled";
+      state.tools = [];
+    } else {
+      if (state.status === "disabled") state.status = "idle";
+      state.discovered = false;
+    }
+    if (persist) {
+      saveProjectMcpOverride(this.cwd, name, { disabled });
+    }
   }
 
   allCachedTools(): CachedTool[] {

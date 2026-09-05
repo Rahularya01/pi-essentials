@@ -12,6 +12,7 @@ This session has a bundled plugin. Prefer these tools over inventing shell worka
 - `mcp({ action: "search", query })` then `describe` then `call`.
 - Do not assume every MCP tool is already in the tool list.
 - If a server needs OAuth, `mcp({ action: "auth", server })`.
+- Use `mcp({ action: "enable", server })` or `mcp({ action: "disable", server })` to manage server availability.
 - `mcp({ action: "status" })` explains why a server has no tools.
 - MCP calls include non-duplicated `structuredContent`. Use prefixed names when an original name is ambiguous; server `isError` results are tool failures.
 
